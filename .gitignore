@@ -1,5 +1,32 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+.pytest_cache/
 venv/
 .venv/
+
+# SQLite sidecar files (data/audit_history.db itself is tracked as seed data)
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# CLI outputs (--out / --pdf)
+report*.json
+report*.pdf
+results*.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local tooling
+.remember/
+graphify-out/
+.playwright-mcp/
