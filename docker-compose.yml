@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   # docker compose run --rm --build test
-  # Behind a profile so `docker compose up` (and the VPS) never builds or
+  # Behind a profile so a plain `docker compose up` never builds or
   # starts it. No network: the suite is meant to run fully offline.
   test:
     build:

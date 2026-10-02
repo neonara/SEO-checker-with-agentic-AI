@@ -22,8 +22,6 @@ RUN pip install -r requirements.txt -r requirements-api.txt
 # thread (measured on the test suite), and would crowd a shared VPS.
 ENV OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1
-# Lets the deploy prune this project's old images without touching others.
-LABEL org.opencontainers.image.title="seo-checker"
 
 # Code stays root-owned: the app user can read and run it, not rewrite it.
 COPY agent/ agent/

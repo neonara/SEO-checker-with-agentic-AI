@@ -9,3 +9,4 @@ venv
 .remember
 graphify-out
 .playwright-mcp
+deploy

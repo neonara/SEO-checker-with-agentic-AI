@@ -70,12 +70,23 @@ planner -> specialists (concurrent, tool-calling) -> postprocess.py (determinist
 - `prod` — every push runs the tests, then deploys to the VPS.
 - Release = merge `main` into `prod` (PR, or `git push origin main:prod`).
 - **Do not push to `prod` unless asked.** It changes the live site.
+- **Do not commit.** Leave changes in the working tree and propose the commit
+  message; the maintainer commits. No AI co-author lines in messages.
 
-Deploy (`.github/workflows/ci.yml`): rsync the repo to the VPS over SSH,
-`docker compose up -d --build`, wait for the container health check. The
-server's `.env` (Groq keys, `APP_PORT`) lives only on the VPS at
-`$VPS_PATH/.env` and is never overwritten. Served over plain HTTP on port
-3003; 3000 and 3001 on that VPS belong to other projects.
+Deploy (`.github/workflows/ci.yml`, prod only): build the runtime image and
+push it to `ghcr.io/neonara/seo-checker-with-agentic-ai` (tags: commit SHA
+and `prod`), copy `deploy/docker-compose.yml` to the VPS, then pipe
+`deploy/deploy.sh` over SSH. That script pulls the SHA, switches the
+container, waits for the health check, and rolls back to the previous image
+if it fails.
+
+- Two compose files: the root `docker-compose.yml` is for development (builds
+  from source); `deploy/docker-compose.yml` is what the VPS runs (pulls from
+  GHCR). A change to ports, volumes or env handling usually belongs in both.
+- The VPS holds only that compose file and a hand-made `.env` (Groq keys,
+  `APP_PORT`) in `$VPS_PATH`; deploys never touch `.env`.
+- Served over plain HTTP on port 3003; 3000 and 3001 on that VPS belong to
+  other projects.
 
 If a reverse proxy is ever put in front, set uvicorn's
 `--forwarded-allow-ips` to it, or every visitor shares one rate-limit bucket.

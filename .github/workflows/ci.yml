@@ -1,7 +1,8 @@
 name: CI
 
 # main  -> tests only. Integration branch: merge and test here, never deploys.
-# prod  -> tests, then deploy to the VPS. To release: merge main into prod.
+# prod  -> tests, build the image and push it to GHCR, deploy it to the VPS.
+#          To release: merge main into prod.
 on:
   push:
     branches: [main, prod]
@@ -27,12 +28,43 @@ jobs:
       - name: Run tests
         run: docker compose run --rm --build test
 
-  deploy:
+  # Build the runtime image and push it to GitHub's registry, tagged with the
+  # commit (what the VPS runs) and with the moving `prod` tag.
+  image:
     needs: test
     if: github.ref == 'refs/heads/prod' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # The source label ties the package to this repository on GitHub.
+          docker build --target runtime \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:prod" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:prod"
+
+  # The VPS never sees the source: it gets one compose file and pulls the image.
+  deploy:
+    needs: image
+    if: github.ref == 'refs/heads/prod' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: production
+    permissions:
+      contents: read
+      packages: read
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -74,42 +106,21 @@ jobs:
             StrictHostKeyChecking yes
           EOF
 
-      # .env is excluded, so --delete never removes the server's secrets.
-      # The live database is in a Docker volume, not in this directory.
-      - name: Copy the code to the VPS
+      # The server's .env sits next to this file and is never touched.
+      - name: Copy the compose file to the VPS
         run: |
           ssh vps "mkdir -p '$VPS_PATH'"
-          rsync -az --delete \
-            --exclude '.git/' --exclude '.github/' --exclude '.env' \
-            ./ "vps:$VPS_PATH/"
+          scp -q deploy/docker-compose.yml "vps:$VPS_PATH/docker-compose.yml"
 
-      # `up --build` builds the new image first and only then replaces the
-      # container, so a failed build leaves the running version untouched.
-      - name: Build and restart
+      # deploy/deploy.sh runs on the VPS: pull this commit's image, switch to
+      # it, roll back to the previous one if it does not come up healthy.
+      # The registry token goes over stdin (first line), never on a command
+      # line; it expires when this run ends.
+      - name: Pull the image and restart
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ssh vps "VPS_PATH='$VPS_PATH' bash -s" <<'REMOTE'
-          set -euo pipefail
-          cd "$VPS_PATH"
-          if [ ! -f .env ]; then
-            echo "::error::$VPS_PATH/.env does not exist on the VPS. Create it from .env.example (it holds the Groq API keys) and re-run."
-            exit 1
-          fi
-          docker compose up -d --build --remove-orphans
-          # Only this project's superseded images; other projects on the box are left alone.
-          docker image prune -f --filter "label=org.opencontainers.image.title=seo-checker" >/dev/null
-
-          cid=$(docker compose ps -q app)
-          for attempt in $(seq 1 60); do
-            status=$(docker inspect --format '{{.State.Health.Status}}' "$cid")
-            if [ "$status" = healthy ]; then
-              echo "Deployed and healthy."
-              docker compose ps app
-              exit 0
-            fi
-            [ "$status" = unhealthy ] && break
-            sleep 2
-          done
-          echo "::error::The new container did not become healthy (last status: $status)."
-          docker compose logs --tail 60 app
-          exit 1
-          REMOTE
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          { printf '%s\n' "$GHCR_TOKEN"; cat deploy/deploy.sh; } | ssh vps \
+            "env VPS_PATH='$VPS_PATH' IMAGE='$IMAGE' IMAGE_TAG='$GITHUB_SHA' GHCR_USER='$GITHUB_ACTOR' \
+             bash -c 'IFS= read -r GHCR_TOKEN; export GHCR_TOKEN; exec bash -s'"

@@ -1,0 +1,24 @@
+# Production compose file. CI copies this to the VPS as
+# $VPS_PATH/docker-compose.yml on every deploy; nothing else from the repo is
+# needed there except a hand-made .env next to it.
+#
+# No build here: the image comes from GHCR, built and pushed by
+# .github/workflows/ci.yml. (The docker-compose.yml at the repo root is the
+# development one, which builds from source.)
+name: seo-checker
+
+services:
+  app:
+    # CI deploys an exact commit (IMAGE_TAG=<sha>). `prod` is the moving tag
+    # for the latest release, used when this is started by hand.
+    image: ${IMAGE:-ghcr.io/neonara/seo-checker-with-agentic-ai}:${IMAGE_TAG:-prod}
+    env_file: .env
+    ports:
+      - "${APP_PORT:-3003}:8000"
+    volumes:
+      # Live audit history. Seeded from the image's data/ on first start only.
+      - seo_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  seo_data:
