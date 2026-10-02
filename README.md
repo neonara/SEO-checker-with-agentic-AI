@@ -658,15 +658,23 @@ merges can trigger a deploy.
 
 ```bash
 cd /opt/seo-checker
-docker compose up -d                       # latest release (the `prod` tag)
+docker compose up -d                          # the current release
+docker compose restart app                    # restart it in place
 IMAGE_TAG=<commit sha> docker compose up -d   # a specific release
 docker compose logs -f app
 ```
 
-The VPS keeps the current and the previous image locally, so going back one
-release needs no download. Pulling by hand needs the package to be readable:
-either make it public once (the package's settings page on GitHub), or run
-`docker login ghcr.io` on the VPS with a token that has `read:packages`.
+None of these needs the registry. Every successful deploy tags its image as
+`prod` on the VPS itself, which is what a plain `docker compose up -d` asks
+for, and the VPS keeps the current and the previous image locally, so going
+back one release needs no download either (`docker image ls` shows the tags
+available). There is nothing to build on the VPS, so `--build` does nothing
+there.
+
+Only pulling an image the VPS does not already hold needs the package to be
+readable: either make it public once (the package's settings page on GitHub)
+or run `docker login ghcr.io -u neonara` on the VPS with a token that has
+`read:packages`.
 
 **Data.** Audit history lives in the Docker volume `seo-checker_seo_data`,
 not in the deploy directory. It is filled from the image's seed database the

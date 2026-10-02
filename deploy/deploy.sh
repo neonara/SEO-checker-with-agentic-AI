@@ -22,9 +22,11 @@ fi
 
 # What is running now, so it can be restored (and kept when cleaning up).
 previous=""
+previous_id=""
 running=$(docker compose ps -q app 2>/dev/null || true)
 if [ -n "$running" ]; then
   previous=$(docker inspect --format '{{.Config.Image}}' "$running")
+  previous_id=$(docker inspect --format '{{.Image}}' "$running")
 fi
 
 if ! docker image inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then
@@ -66,10 +68,19 @@ docker compose up -d --remove-orphans
 if wait_until_healthy; then
   echo "Deployed $IMAGE:$IMAGE_TAG and healthy."
   docker compose ps app
-  # Keep the release just replaced (for a quick rollback); drop older ones.
-  docker image ls "$IMAGE" --format '{{.Repository}}:{{.Tag}}' \
-    | grep -vxF -e "$IMAGE:$IMAGE_TAG" -e "$previous" \
-    | xargs -r docker image rm >/dev/null 2>&1 || true
+  # Point the local `prod` tag at this release, so a plain `docker compose
+  # up -d` by hand (which asks for :prod) starts it without needing to reach
+  # the registry. Done only now, so until a release is healthy :prod still
+  # means the one before it.
+  docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:prod"
+  # Keep this release and the one just replaced (for a quick rollback),
+  # under whatever tags they have; drop older ones.
+  current_id=$(docker image inspect --format '{{.Id}}' "$IMAGE:$IMAGE_TAG")
+  docker image ls "$IMAGE" --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}' | while read -r ref id; do
+    if [ "$id" != "$current_id" ] && [ "$id" != "$previous_id" ]; then
+      docker image rm "$ref" >/dev/null 2>&1 || true
+    fi
+  done
   exit 0
 fi
 
