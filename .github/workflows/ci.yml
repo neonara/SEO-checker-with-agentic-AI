@@ -41,12 +41,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Registry login: the GHCR_PAT secret (a personal access token with
+      # write:packages), as the user it belongs to. Without that secret this
+      # falls back to the run's own token, which only works where the
+      # organisation lets Actions write packages.
       - name: Build and push to GHCR
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ vars.GHCR_USER || 'neonara' }}
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           # The source label ties the package to this repository on GitHub.
           docker build --target runtime \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
@@ -115,12 +120,14 @@ jobs:
       # deploy/deploy.sh runs on the VPS: pull this commit's image, switch to
       # it, roll back to the previous one if it does not come up healthy.
       # The registry token goes over stdin (first line), never on a command
-      # line; it expires when this run ends.
+      # line, and is used through a throwaway Docker config on the VPS, so it
+      # is not left behind there.
       - name: Pull the image and restart
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ vars.GHCR_USER || 'neonara' }}
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           { printf '%s\n' "$GHCR_TOKEN"; cat deploy/deploy.sh; } | ssh vps \
-            "env VPS_PATH='$VPS_PATH' IMAGE='$IMAGE' IMAGE_TAG='$GITHUB_SHA' GHCR_USER='$GITHUB_ACTOR' \
+            "env VPS_PATH='$VPS_PATH' IMAGE='$IMAGE' IMAGE_TAG='$GITHUB_SHA' GHCR_USER='$GHCR_USER' \
              bash -c 'IFS= read -r GHCR_TOKEN; export GHCR_TOKEN; exec bash -s'"

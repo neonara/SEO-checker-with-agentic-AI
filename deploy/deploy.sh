@@ -28,9 +28,9 @@ if [ -n "$running" ]; then
 fi
 
 if ! docker image inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then
-  # Log in through a throwaway config directory: the token CI passes expires
-  # with the workflow run, and this must not replace a GHCR login that other
-  # projects on this machine rely on.
+  # Log in through a throwaway config directory, deleted when this script
+  # ends: the token CI passes must not be left on this machine, and must not
+  # replace a GHCR login that other projects here rely on.
   registry_config=$(mktemp -d)
   trap 'rm -rf "$registry_config"' EXIT
   if [ -n "${GHCR_TOKEN:-}" ]; then

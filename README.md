@@ -640,14 +640,18 @@ After a deploy that directory holds exactly two files: `docker-compose.yml`
 | `VPS_HOST` | secret | Server address |
 | `VPS_USER` | secret | SSH user |
 | `VPS_SSH_KEY` | secret | Private key for that user (the whole file) |
+| `GHCR_PAT` | secret | Personal access token (classic) with `write:packages`, used to push the image and to let the VPS pull it |
+| `GHCR_USER` | variable, optional | Username for the GHCR login (default `neonara`) |
 | `VPS_KNOWN_HOSTS` | secret, optional | Output of `ssh-keyscan <host>`, to pin the server's host key |
 | `VPS_SSH_PORT` | variable, optional | SSH port (default 22) |
 | `VPS_PATH` | variable, optional | Directory on the VPS (default `/opt/seo-checker`) |
 
-No registry secret is needed: the workflow pushes with its own token and
-hands the VPS that same short-lived token for the pull, through a temporary
-Docker config, so any GHCR login other projects use on that machine is left
-alone. A branch protection rule on `prod` is worth adding, so only reviewed
+The workflow logs in to GHCR with `GHCR_PAT` to push, and hands the VPS that
+same token for the pull, through a temporary Docker config that is deleted
+afterwards, so the token is not stored on the VPS and any GHCR login other
+projects use on that machine is left alone. (Without `GHCR_PAT` it falls
+back to the run's own token, which only works if the organisation allows
+Actions to write packages.) A branch protection rule on `prod` is worth adding, so only reviewed
 merges can trigger a deploy.
 
 **Running or rolling back by hand on the VPS**
