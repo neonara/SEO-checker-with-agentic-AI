@@ -1,9 +1,10 @@
 import os
 
 # Groq's OpenAI-compatible chat model used by the planner, specialists,
-# synthesizer, and critic. llama-3.3-70b-versatile is a strong, free-tier
-# general-purpose model with solid tool-calling support.
-DEFAULT_MODEL = os.environ.get("SEO_AGENT_MODEL", "llama-3.3-70b-versatile")
+# synthesizer, and critic. openai/gpt-oss-120b is Groq's named replacement
+# for llama-3.3-70b-versatile, which this project was built and tuned on and
+# which Groq shut down for free/developer-tier keys on 2026-08-16.
+DEFAULT_MODEL = os.environ.get("SEO_AGENT_MODEL", "openai/gpt-oss-120b")
 PLANNER_MODEL = os.environ.get("SEO_AGENT_PLANNER_MODEL", DEFAULT_MODEL)
 CRITIC_MODEL = os.environ.get("SEO_AGENT_CRITIC_MODEL", DEFAULT_MODEL)
 
@@ -11,12 +12,18 @@ CRITIC_MODEL = os.environ.get("SEO_AGENT_CRITIC_MODEL", DEFAULT_MODEL)
 # If the primary model's quota is exhausted, agents automatically fall back
 # to this smaller/faster model instead of failing outright, since it draws
 # from a completely separate quota pool. Set to "" to disable fallback.
-FALLBACK_MODEL = os.environ.get("SEO_AGENT_FALLBACK_MODEL", "llama-3.1-8b-instant")
+# (openai/gpt-oss-20b replaces llama-3.1-8b-instant, shut down the same day.)
+FALLBACK_MODEL = os.environ.get("SEO_AGENT_FALLBACK_MODEL", "openai/gpt-oss-20b")
 
 # Groq's built-in agentic "Compound" system, used only by the competitive/
 # benchmarking specialist. It performs live web search server-side, so no
 # custom tool schema is needed (and Groq does not allow mixing custom tools
 # with Compound systems at this time).
+# NOTE: Groq shut the Compound systems down on 2026-09-21 with no drop-in
+# replacement, so this specialist currently fails (and its category is
+# dropped) in auto/deep mode. Do not just point this at a plain chat model:
+# the specialist's prompt assumes built-in search and it would invent its
+# "research". It needs Groq's browser_search tool wired in first.
 COMPETITIVE_MODEL = os.environ.get("SEO_AGENT_COMPETITIVE_MODEL", "groq/compound-mini")
 
 # One or more Groq API keys, tried in order. Each key has its own separate

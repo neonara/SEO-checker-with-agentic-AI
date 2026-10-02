@@ -268,7 +268,7 @@ Files written with `--out` / `--pdf` land inside the container; point them at
 # Full multi-agent audit (auto mode: strong model, falls back if needed)
 python main.py audit https://example.com
 
-# Fast, always-available mode -- skips the 70B model entirely
+# Fast, always-available mode -- skips the large model entirely
 python main.py audit https://example.com --mode quick
 
 # Best-quality mode -- only the strong model, fails clearly rather than
@@ -314,8 +314,9 @@ print(report["overall_score"], report["grade"], report["review_status"])
 ├── api.py                   FastAPI backend: job-based audit API + serves web/
 ├── web/index.html           the one-page frontend (no build step)
 ├── Dockerfile               base / test / runtime stages
-├── docker-compose.yml       `app` (the server) and `test` (the suite) services
-├── .github/workflows/ci.yml tests on main, tests + deploy on prod
+├── docker-compose.yml       development: `app` (builds from source) and `test` (the suite)
+├── deploy/                  production: the compose file and script the VPS runs
+├── .github/workflows/ci.yml tests on main; tests, image to GHCR and deploy on prod
 ├── pytest.ini
 ├── requirements.txt         core dependencies
 ├── requirements-api.txt     web server dependencies
@@ -406,11 +407,11 @@ All overridable via environment variables (see `.env.example`):
 | `GROQ_API_KEY` | — (required unless `GROQ_API_KEYS` set) | API auth |
 | `GROQ_API_KEYS` | — (optional) | Comma-separated list of multiple keys; specialists and synthesizer/critic calls round-robin across them for the whole run |
 | `GOOGLE_PAGESPEED_API_KEY` | — (optional) | Raises the rate limit on real Lighthouse audits; works without one at a lower limit |
-| `SEO_AGENT_MODEL` | `llama-3.3-70b-versatile` | Primary model used by specialists, synthesizer |
+| `SEO_AGENT_MODEL` | `openai/gpt-oss-120b` | Primary model used by specialists, synthesizer |
 | `SEO_AGENT_PLANNER_MODEL` | same as above | Model for the planner agent |
 | `SEO_AGENT_CRITIC_MODEL` | same as above | Model for the critic agent |
-| `SEO_AGENT_FALLBACK_MODEL` | `llama-3.1-8b-instant` | Used automatically on a rate/quota limit (separate quota pool); empty disables fallback |
-| `SEO_AGENT_COMPETITIVE_MODEL` | `groq/compound-mini` | Groq's built-in web-search system, competitive specialist only |
+| `SEO_AGENT_FALLBACK_MODEL` | `openai/gpt-oss-20b` | Used automatically on a rate/quota limit (separate quota pool); empty disables fallback |
+| `SEO_AGENT_COMPETITIVE_MODEL` | `groq/compound-mini` | Competitive specialist only. Groq shut Compound down on 2026-09-21, so this section is currently skipped in auto/deep mode until `browser_search` is wired in |
 | `SEO_AGENT_MAX_ITER` | 10 | Max tool-call iterations per agent |
 | `SEO_AGENT_MAX_REFLECTION_ROUNDS` | 2 | Max critic revision rounds |
 | `SEO_AGENT_MAX_WORKERS` | 2 | Max concurrent specialist agents |
@@ -600,29 +601,37 @@ than training on an unusable split.
 
 ## Deployment
 
-Hosted with Docker on a VPS, deployed by GitHub Actions
-(`.github/workflows/ci.yml`).
+Hosted with Docker on a VPS. GitHub Actions (`.github/workflows/ci.yml`)
+builds the image, pushes it to GitHub's container registry (GHCR), and has
+the VPS pull and run it. The VPS never holds the source code.
 
 **Branches.** `main` is for merging and testing: every push and pull request
-runs the test suite and stops there. `prod` is the only branch that deploys:
-a push to it runs the tests again and, if they pass, updates the VPS. To
-release, merge `main` into `prod` (open a pull request, or fast-forward with
-`git push origin main:prod`).
+runs the test suite and stops there. `prod` is the only branch that deploys.
+To release, merge `main` into `prod` (open a pull request, or fast-forward
+with `git push origin main:prod`).
 
-**What a deploy does.** Copies the repository to the VPS over SSH (`rsync`),
-runs `docker compose up -d --build` there, and waits for the container's
-health check. The new image is built before the old container is replaced,
-so a failed build leaves the running version untouched.
+**What a push to `prod` does**
+
+1. Runs the tests.
+2. Builds the runtime image and pushes it to
+   `ghcr.io/neonara/seo-checker-with-agentic-ai`, tagged with the commit SHA
+   and with `prod` (always the latest release).
+3. Copies `deploy/docker-compose.yml` to the VPS and runs `deploy/deploy.sh`
+   there: pull that exact SHA, switch the container to it, wait for the
+   health check. If the new container does not come up healthy, the previous
+   image is put back and the job fails.
 
 **One-time setup on the VPS**
 
-1. Docker with Compose 2.24 or newer, and a user allowed to run it (in the
+1. Docker with the Compose plugin, and a user allowed to run it (in the
    `docker` group) that accepts the deploy SSH key.
 2. Create the directory (default `/opt/seo-checker`), owned by that user.
-3. Put a `.env` in it, based on `.env.example`, with the Groq key(s). Deploys
-   never overwrite or delete this file, and refuse to run if it is missing.
-4. Open the port in the firewall (default 3003; change it with `APP_PORT` in
-   that `.env`).
+3. Put a `.env` in it, based on `.env.example`, with the Groq key(s) and
+   `APP_PORT`. Deploys never touch this file, and refuse to run without it.
+4. Open the port in the firewall (default 3003).
+
+After a deploy that directory holds exactly two files: `docker-compose.yml`
+(overwritten on each deploy) and your `.env`.
 
 **One-time setup on GitHub** (Settings → Secrets and variables → Actions)
 
@@ -635,14 +644,30 @@ so a failed build leaves the running version untouched.
 | `VPS_SSH_PORT` | variable, optional | SSH port (default 22) |
 | `VPS_PATH` | variable, optional | Directory on the VPS (default `/opt/seo-checker`) |
 
-A branch protection rule on `prod` is worth adding, so only reviewed merges
-can trigger a deploy.
+No registry secret is needed: the workflow pushes with its own token and
+hands the VPS that same short-lived token for the pull, through a temporary
+Docker config, so any GHCR login other projects use on that machine is left
+alone. A branch protection rule on `prod` is worth adding, so only reviewed
+merges can trigger a deploy.
+
+**Running or rolling back by hand on the VPS**
+
+```bash
+cd /opt/seo-checker
+docker compose up -d                       # latest release (the `prod` tag)
+IMAGE_TAG=<commit sha> docker compose up -d   # a specific release
+docker compose logs -f app
+```
+
+The VPS keeps the current and the previous image locally, so going back one
+release needs no download. Pulling by hand needs the package to be readable:
+either make it public once (the package's settings page on GitHub), or run
+`docker login ghcr.io` on the VPS with a token that has `read:packages`.
 
 **Data.** Audit history lives in the Docker volume `seo-checker_seo_data`,
-not in the deploy directory. It is filled from the repository's
-`data/audit_history.db` the first time the container starts and never
-overwritten after that. Back it up with
-`docker compose cp app:/app/data/audit_history.db ./backup.db`.
+not in the deploy directory. It is filled from the image's seed database the
+first time the container starts and never overwritten after that. Back it up
+with `docker compose cp app:/app/data/audit_history.db ./backup.db`.
 
 **After the first deploy**, check `docker compose logs app`: each request line
 starts with the visitor's IP. If every line shows the same Docker-internal
@@ -650,6 +675,13 @@ address, the per-visitor rate limit is being shared by everyone, which
 happens on hosts where Docker does not preserve source addresses.
 
 ## Honest limitations
+
+- The models changed under this project. It was built, tuned and tested on
+  `llama-3.3-70b-versatile` and `llama-3.1-8b-instant`, which Groq shut down
+  for free-tier keys on 2026-08-16. The defaults are now Groq's named
+  replacements (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`). The offline
+  test suite does not exercise a real model, so the behaviour described in
+  "How this project evolved" was observed on the old models, not these.
 
 - No JavaScript rendering for HTML parsing (though real Core Web Vitals do
   come from a genuine browser-based Lighthouse audit, which renders JS).
