@@ -541,3 +541,105 @@ class TestCheckBestPractices:
         with patch.object(tools.requests, "get", return_value=resp):
             result = tools.check_best_practices("example.com")
         assert len(result["failing_best_practices_audits"]) == 12
+
+class TestOutboundGuard:
+    """agent/netguard.py wired into the tools. Off unless the env var is set,
+    which is why every other test in this file runs unguarded."""
+
+    def setup_method(self):
+        tools._page_cache.clear()
+
+    @pytest.fixture
+    def guard_on(self, monkeypatch):
+        monkeypatch.setenv("SEO_AGENT_BLOCK_PRIVATE_HOSTS", "1")
+
+    @pytest.fixture
+    def public_dns(self, monkeypatch):
+        monkeypatch.setattr(
+            tools.netguard.socket, "getaddrinfo",
+            lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+        )
+
+    def test_guard_is_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("SEO_AGENT_BLOCK_PRIVATE_HOSTS", raising=False)
+        resp = _fake_response(200, text="<html>dev</html>", url="http://127.0.0.1")
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            result = tools.fetch_page("http://127.0.0.1")
+        assert result["ok"] is True
+        assert "hooks" not in mock_get.call_args.kwargs
+
+    def test_fetch_page_refuses_internal_address_without_requesting_it(self, guard_on):
+        with patch.object(tools.requests, "get") as mock_get:
+            result = tools.fetch_page("http://169.254.169.254/latest/meta-data/")
+        assert result["ok"] is False
+        assert "not a public internet address" in result["error"]
+        mock_get.assert_not_called()
+        assert tools._page_cache == {}
+
+    def test_parse_seo_elements_cannot_reach_internal_address_either(self, guard_on):
+        with patch.object(tools.requests, "get") as mock_get:
+            result = tools.parse_seo_elements("http://127.0.0.1")
+        assert result["ok"] is False
+        mock_get.assert_not_called()
+
+    def test_public_address_is_fetched_with_redirect_check_attached(self, guard_on, public_dns):
+        resp = _fake_response(200, text="<html>hi</html>")
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            result = tools.fetch_page("example.com")
+        assert result["ok"] is True
+        assert mock_get.call_args.kwargs["hooks"] == {"response": tools._refuse_private_redirect}
+
+    def test_redirect_to_internal_address_is_refused(self, guard_on):
+        hop = MagicMock(is_redirect=True, url="https://example.com/go", headers={"location": "http://127.0.0.1/admin"})
+        with pytest.raises(requests.exceptions.InvalidURL, match="Redirect refused"):
+            tools._refuse_private_redirect(hop)
+
+    def test_relative_redirect_is_resolved_against_the_current_url(self, guard_on, public_dns):
+        hop = MagicMock(is_redirect=True, url="https://example.com/a", headers={"location": "/b"})
+        assert tools._refuse_private_redirect(hop) is None
+
+    def test_non_redirect_response_passes_the_hook(self, guard_on):
+        assert tools._refuse_private_redirect(MagicMock(is_redirect=False)) is None
+
+    def test_refused_redirect_surfaces_as_a_normal_fetch_error(self, guard_on, public_dns):
+        refused = requests.exceptions.InvalidURL("Redirect refused: Host '127.0.0.1' is not a public internet address.")
+        with patch.object(tools.requests, "get", side_effect=refused):
+            result = tools.fetch_page("example.com")
+        assert result["ok"] is False
+        assert "Redirect refused" in result["error"]
+
+    def test_robots_and_sitemap_refuse_internal_address(self, guard_on):
+        with patch.object(tools.requests, "get") as mock_get:
+            robots = tools.fetch_robots_txt("http://10.0.0.5")
+            sitemap = tools.fetch_sitemap("http://10.0.0.5")
+        assert robots["ok"] is False
+        assert sitemap["ok"] is False and sitemap["exists"] is False
+        mock_get.assert_not_called()
+
+    def test_ssl_check_refuses_internal_address_without_connecting(self, guard_on):
+        with patch.object(tools.socket, "create_connection") as mock_connect:
+            result = tools.check_ssl_certificate("https://192.168.1.1")
+        assert result["ok"] is False
+        mock_connect.assert_not_called()
+
+    def test_internal_links_are_skipped_not_reported_as_broken(self, guard_on):
+        with patch.object(tools.requests, "head") as mock_head:
+            result = tools.check_links_status(["http://127.0.0.1/a", "http://10.0.0.5/b"])
+        mock_head.assert_not_called()
+        assert result["broken_count"] == 0
+        assert all(r["broken"] is False and "skipped" in r for r in result["results"])
+
+    def test_public_links_are_still_checked(self, guard_on, public_dns):
+        with patch.object(tools.requests, "head", return_value=_fake_response(404)), \
+             patch.object(tools.requests, "get", return_value=_fake_response(404)):
+            result = tools.check_links_status(["https://example.com/gone"])
+        assert result["broken_count"] == 1
+
+
+class TestClearCaches:
+    def test_empties_both_caches(self):
+        tools._page_cache["https://example.com"] = "<html></html>"
+        tools._lighthouse_cache[("https://example.com", "mobile")] = {"x": 1}
+        tools.clear_caches()
+        assert tools._page_cache == {}
+        assert tools._lighthouse_cache == {}

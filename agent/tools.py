@@ -16,6 +16,8 @@ from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 
+from . import netguard
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
@@ -42,11 +44,46 @@ def normalize_url(url: str) -> str:
     return url
 
 
+def _blocked_reason(url: str) -> str | None:
+    """Why this url must not be fetched, or None. Always None unless the
+    outbound guard is switched on (see netguard.py) -- the model picks the
+    urls these tools receive, so the check has to live here and not only
+    where the visitor's url first comes in."""
+    return netguard.check_url(url) if netguard.enabled() else None
+
+
+def _refuse_private_redirect(resp, *args, **kwargs):
+    # requests runs this on every hop, before following it.
+    if resp.is_redirect:
+        target = urljoin(resp.url, resp.headers.get("location", ""))
+        reason = netguard.check_url(target)
+        if reason:
+            raise requests.exceptions.InvalidURL(f"Redirect refused: {reason}")
+
+
+def _guard_kwargs() -> dict:
+    """Extra requests kwargs that re-check each redirect hop when the guard
+    is on; nothing at all when it is off."""
+    return {"hooks": {"response": _refuse_private_redirect}} if netguard.enabled() else {}
+
+
+def clear_caches() -> None:
+    """Drop the server-side HTML and Lighthouse caches. They exist to share
+    data between the specialists of ONE audit; a long-running server has to
+    empty them between audits or a re-audit hours later would silently be
+    scored on the first audit's stale data (and memory would only grow)."""
+    _page_cache.clear()
+    _lighthouse_cache.clear()
+
+
 def fetch_page(url: str) -> dict:
     """Fetch a page, cache its HTML server-side, and return only lightweight
     metadata to the model (status, timing, headers) -- NOT the HTML itself.
     Call parse_seo_elements with the same url to extract SEO signals."""
     url = normalize_url(url)
+    blocked = _blocked_reason(url)
+    if blocked:
+        return {"ok": False, "requested_url": url, "error": blocked}
     try:
         start = time.time()
         resp = requests.get(
@@ -54,6 +91,7 @@ def fetch_page(url: str) -> dict:
             headers={"User-Agent": USER_AGENT},
             timeout=DEFAULT_TIMEOUT,
             allow_redirects=True,
+            **_guard_kwargs(),
         )
         elapsed_ms = round((time.time() - start) * 1000, 1)
         _page_cache[url] = resp.text
@@ -186,8 +224,12 @@ def parse_seo_elements(url: str) -> dict:
 def fetch_robots_txt(domain_or_url: str) -> dict:
     parsed = urlparse(normalize_url(domain_or_url))
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    blocked = _blocked_reason(robots_url)
+    if blocked:
+        return {"ok": False, "url": robots_url, "error": blocked}
     try:
-        resp = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
+        resp = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT,
+                            **_guard_kwargs())
         return {
             "ok": True,
             "url": robots_url,
@@ -206,9 +248,13 @@ def fetch_sitemap(domain_or_url: str) -> dict:
         f"{parsed.scheme}://{parsed.netloc}/sitemap.xml",
         f"{parsed.scheme}://{parsed.netloc}/sitemap_index.xml",
     ]
+    blocked = _blocked_reason(candidates[0])
+    if blocked:
+        return {"ok": False, "exists": False, "error": blocked}
     for sitemap_url in candidates:
         try:
-            resp = requests.get(sitemap_url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
+            resp = requests.get(sitemap_url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT,
+                                **_guard_kwargs())
             if resp.status_code == 200 and "xml" in resp.headers.get("Content-Type", "").lower():
                 url_count = resp.text.count("<url>") + resp.text.count("<sitemap>")
                 return {
@@ -227,6 +273,10 @@ def fetch_sitemap(domain_or_url: str) -> dict:
 def check_ssl_certificate(domain_or_url: str) -> dict:
     parsed = urlparse(normalize_url(domain_or_url))
     hostname = parsed.netloc.split(":")[0]
+    if netguard.enabled():
+        blocked = netguard.check_host(hostname)
+        if blocked:
+            return {"ok": False, "error": blocked}
     try:
         # Use certifi's actively-maintained CA bundle (same one `requests` uses
         # internally) instead of relying solely on the OS trust store, which can
@@ -576,10 +626,19 @@ def check_links_status(urls: list[str]) -> dict:
     """HEAD (fallback GET) a small sample of links to find broken ones."""
     results = []
     for url in urls[:10]:
+        # Only http(s) links are guarded; anything else falls through to
+        # requests and fails there exactly as it did before.
+        blocked = _blocked_reason(url) if url.startswith(("http://", "https://")) else None
+        if blocked:
+            # Not checked is not the same as broken -- don't report it as one.
+            results.append({"url": url, "status_code": None, "broken": False, "skipped": blocked})
+            continue
         try:
-            resp = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=6, allow_redirects=True)
+            resp = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=6, allow_redirects=True,
+                                 **_guard_kwargs())
             if resp.status_code >= 400:
-                resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=6, allow_redirects=True)
+                resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=6, allow_redirects=True,
+                                    **_guard_kwargs())
             results.append({"url": url, "status_code": resp.status_code, "broken": resp.status_code >= 400})
         except requests.exceptions.RequestException as e:
             results.append({"url": url, "status_code": None, "broken": True, "error": str(e)})
