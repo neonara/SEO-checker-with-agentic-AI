@@ -12,12 +12,13 @@ open-weight models) — no paid model provider required. Hardened through
 extensive real-world testing against live sites (Wikipedia, YouTube, Apple,
 Samsung, Internet Archive's blog, and others) to survive both Groq's
 free-tier limits and the kinds of mistakes LLMs make when asked to
-self-report facts and do arithmetic. Backed by a 348-test automated
+self-report facts and do arithmetic. Backed by a 435-test automated
 `pytest` suite and a self-grading eval harness (see Testing / Eval harness
 below).
 
-No frontend in this document — CLI + importable library. (A Next.js web UI
-exists as a separate, in-progress add-on; see the `webapp/` project.)
+Three ways in, all on the same `run_full_audit()` function: a CLI, an
+importable library, and a small web app (a FastAPI backend plus a one-page
+frontend, see "Web app" below) that deploys to a VPS with Docker.
 
 ## Architecture
 
@@ -186,7 +187,7 @@ clean first run meant it worked.
 9. **Multi-key, multi-model resilience** — automatic model fallback,
    proactive round-robin across all configured keys for the entire run,
    proactive *and* reactive payload shrinking, JSON self-repair retries.
-10. **348-test automated regression suite** — see Testing below.
+10. **435-test automated regression suite** — see Testing below.
 11. **Self-grading eval harness** — runs the real pipeline against a
     randomly-sampled pool of benchmark sites with known, verifiable
     issues, graded in pure Python (no LLM call spent on grading). See Eval
@@ -207,12 +208,15 @@ clean first run meant it worked.
 
 ## Setup
 
+Everything runs in Docker (Compose 2.24 or newer). There is no virtualenv to
+create and nothing to install on the host.
+
 ```bash
-cd seo_agent
-python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt
 cp .env.example .env   # then edit .env and add your GROQ_API_KEY
+docker compose up --build
 ```
+
+That builds the image and serves the web app on http://localhost:3003.
 
 Get a **free** API key at https://console.groq.com/keys. Optionally get a
 free Google PageSpeed Insights key at
@@ -220,7 +224,45 @@ https://developers.google.com/speed/docs/insights/v5/get-started for a
 higher rate limit on real Lighthouse audits (works without one too, at a
 lower rate limit).
 
-## Usage
+## Web app
+
+Open http://localhost:3003, paste an address, and press **Scan site**. The
+page shows the four pipeline stages and the live agent log while the audit
+runs, then the graded report: findings by category (worst first), quick
+wins, and details including what the reviewer agent still objected to and
+the site's score history.
+
+`api.py` is the backend behind it:
+
+| Route | Purpose |
+|---|---|
+| `POST /api/audit` | Start an audit: `{"url", "mode", "competitor_url"}` → `{"job_id"}` |
+| `GET /api/audit/{job_id}` | Poll: `status` (`running` / `done` / `error`), live `logs`, final `report` |
+| `GET /api/history/{domain}` | Past scores for a domain |
+| `GET /api/health` | Liveness, used by the container health check |
+
+Because it is meant to be reachable from the internet, starting an audit is
+limited (all adjustable in `.env`, see Configuration):
+
+- **Public addresses only.** Loopback, private-network and cloud-metadata
+  addresses, and non-web ports, are refused — both for the submitted URL and
+  for every URL the agents' tools fetch afterwards, redirects included
+  (`agent/netguard.py`).
+- **5 audits per hour per visitor IP**, and **2 audits at a time** overall.
+  Every audit spends shared Groq free-tier quota.
+- Asking for an audit that is already running returns the running job.
+
+Jobs live in the server's memory: results stay retrievable for an hour and
+are lost on restart (the audit itself is still saved to the history
+database). This is also why the server runs exactly one worker.
+
+## Usage (CLI)
+
+Each command below runs inside the container, so prefix it with
+`docker compose run --rm app` — for example
+`docker compose run --rm app python main.py audit https://example.com`.
+Files written with `--out` / `--pdf` land inside the container; point them at
+`/app/data/` to keep them in the data volume.
 
 ```bash
 # Full multi-agent audit (auto mode: strong model, falls back if needed)
@@ -267,11 +309,19 @@ print(report["overall_score"], report["grade"], report["review_status"])
 ## Project layout
 
 ```
-seo_agent/
+.
 ├── main.py                  CLI entry point (audit / history / eval / analyze, --mode flag)
-├── pytest.ini                pytest config -- `pytest` just works from the project root
-├── requirements.txt
+├── api.py                   FastAPI backend: job-based audit API + serves web/
+├── web/index.html           the one-page frontend (no build step)
+├── Dockerfile               base / test / runtime stages
+├── docker-compose.yml       `app` (the server) and `test` (the suite) services
+├── .github/workflows/ci.yml tests on main, tests + deploy on prod
+├── pytest.ini
+├── requirements.txt         core dependencies
+├── requirements-api.txt     web server dependencies
+├── requirements-dev.txt     test dependencies
 ├── .env.example
+├── CLAUDE.md                working notes for Claude Code
 ├── README.md
 ├── agent/
 │   ├── __init__.py           exposes run_full_audit
@@ -297,16 +347,19 @@ seo_agent/
 │   ├── analytics.py           Score Analytics -- see "Score Analytics" below
 │   ├── similarity_search.py   Findings Similarity Search -- see below
 │   ├── critic_predictor.py    Critic-Approval Predictor -- see below
-│   └── compaction.py          proactive payload compaction (see "How this project evolved")
-└── tests/                     348 pytest tests -- see "Testing" below
+│   ├── compaction.py          proactive payload compaction (see "How this project evolved")
+│   └── netguard.py            refuses fetches to private/loopback addresses (web deployment)
+└── tests/                     435 pytest tests -- see "Testing" below
     ├── conftest.py             shared fixtures: fake Groq client/errors, sample report data
     ├── test_analytics.py       feature engineering, correlations, model training/comparison
+    ├── test_api.py             the HTTP API: job lifecycle, URL validation, rate/concurrency limits
     ├── test_base_agent.py      retry/backoff/rate-limit engine, the tool-call loop
     ├── test_compaction.py      proactive payload trimming, incl. actual wiring
     ├── test_critic.py          reflection loop, incl. a dedicated regression test
     ├── test_critic_predictor.py  classification feature engineering, class balance, classifier comparison
     ├── test_eval_harness.py    eval harness grading logic (run_full_audit fully mocked)
     ├── test_memory.py          SQLite persistence
+    ├── test_netguard.py        which addresses, ports and schemes are refused
     ├── test_orchestrator.py    score/weight reconciliation, category recovery, pipeline wiring
     ├── test_postprocess.py     every deterministic reconciliation function
     ├── test_schemas.py         the Pydantic report contract
@@ -368,18 +421,25 @@ All overridable via environment variables (see `.env.example`):
 | `SEO_AGENT_COMPACTION_MAX_FINDINGS` | 12 | Max findings kept per category when compacting |
 | `SEO_AGENT_COMPACTION_MAX_EVIDENCE_CHARS` | 600 | Max length for evidence notes/critic instructions when compacting |
 | `SEO_AGENT_COMPACTION_MAX_FINDING_CHARS` | 400 | Max length for a finding's issue/recommendation text when compacting |
+| `SEO_AGENT_BLOCK_PRIVATE_HOSTS` | off (`1` in the Docker image) | Refuse to fetch loopback/private/link-local addresses and non-web ports. Keep on for anything public |
+| `APP_PORT` | 3003 | Host port the web app is published on (docker compose) |
+| `SEO_API_RATE_LIMIT_PER_HOUR` | 5 | Audits one visitor IP may start per hour; 0 disables |
+| `SEO_API_MAX_CONCURRENT` | 2 | Audits allowed to run at once |
+| `SEO_API_JOB_TTL_SECONDS` | 3600 | How long a finished job's result stays retrievable |
+| `SEO_API_CORS_ORIGINS` | — | Comma-separated origins allowed to call the API from another site |
 
 CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
 
 ## Testing
 
 ```bash
-pip install pytest   # already in requirements.txt
-pytest                # runs all 348 tests, zero network/API calls
+docker compose run --rm --build test                                    # all 435 tests
+docker compose run --rm --build test pytest tests/test_tools.py -k ssl   # a subset
 ```
 
 Every test mocks the Groq client and any network calls — the suite runs
-with no API key and no internet access. A few worth calling out:
+with no API key, and the test container has networking switched off, so a
+test that tried to reach the internet would fail. A few worth calling out:
 
 - `test_critic.py` reintroduces the exact reflection-loop regression noted
   above to confirm it's genuinely caught, verified by temporarily
@@ -538,6 +598,57 @@ Training needs a reasonable count of *both* outcomes (≥5 each); with too
 few examples of one class, it refuses to report misleading metrics rather
 than training on an unusable split.
 
+## Deployment
+
+Hosted with Docker on a VPS, deployed by GitHub Actions
+(`.github/workflows/ci.yml`).
+
+**Branches.** `main` is for merging and testing: every push and pull request
+runs the test suite and stops there. `prod` is the only branch that deploys:
+a push to it runs the tests again and, if they pass, updates the VPS. To
+release, merge `main` into `prod` (open a pull request, or fast-forward with
+`git push origin main:prod`).
+
+**What a deploy does.** Copies the repository to the VPS over SSH (`rsync`),
+runs `docker compose up -d --build` there, and waits for the container's
+health check. The new image is built before the old container is replaced,
+so a failed build leaves the running version untouched.
+
+**One-time setup on the VPS**
+
+1. Docker with Compose 2.24 or newer, and a user allowed to run it (in the
+   `docker` group) that accepts the deploy SSH key.
+2. Create the directory (default `/opt/seo-checker`), owned by that user.
+3. Put a `.env` in it, based on `.env.example`, with the Groq key(s). Deploys
+   never overwrite or delete this file, and refuse to run if it is missing.
+4. Open the port in the firewall (default 3003; change it with `APP_PORT` in
+   that `.env`).
+
+**One-time setup on GitHub** (Settings → Secrets and variables → Actions)
+
+| Name | Kind | Value |
+|---|---|---|
+| `VPS_HOST` | secret | Server address |
+| `VPS_USER` | secret | SSH user |
+| `VPS_SSH_KEY` | secret | Private key for that user (the whole file) |
+| `VPS_KNOWN_HOSTS` | secret, optional | Output of `ssh-keyscan <host>`, to pin the server's host key |
+| `VPS_SSH_PORT` | variable, optional | SSH port (default 22) |
+| `VPS_PATH` | variable, optional | Directory on the VPS (default `/opt/seo-checker`) |
+
+A branch protection rule on `prod` is worth adding, so only reviewed merges
+can trigger a deploy.
+
+**Data.** Audit history lives in the Docker volume `seo-checker_seo_data`,
+not in the deploy directory. It is filled from the repository's
+`data/audit_history.db` the first time the container starts and never
+overwritten after that. Back it up with
+`docker compose cp app:/app/data/audit_history.db ./backup.db`.
+
+**After the first deploy**, check `docker compose logs app`: each request line
+starts with the visitor's IP. If every line shows the same Docker-internal
+address, the per-visitor rate limit is being shared by everyone, which
+happens on hosts where Docker does not preserve source addresses.
+
 ## Honest limitations
 
 - No JavaScript rendering for HTML parsing (though real Core Web Vitals do
@@ -553,6 +664,12 @@ than training on an unusable split.
   sample size behind them (see the `reliable` flag). The Critic-Approval
   Predictor refuses to train when either outcome class is too small,
   rather than reporting a misleading accuracy number.
+- The web app keeps running jobs and rate-limit counters in memory: one
+  server process, results gone after a restart, and no HTTPS until a domain
+  and reverse proxy are put in front of it.
+- The private-address guard resolves a hostname and then lets the HTTP client
+  resolve it again, so a DNS record that changes between the two lookups (DNS
+  rebinding) is not caught.
 - Groq's free tier has real daily quota limits per model *and*
   organization — multiple API keys only help if they're genuinely separate
   accounts, not just multiple keys on one.
@@ -565,8 +682,9 @@ than training on an unusable split.
 
 ## Possible next steps
 
-- Wrap `run_full_audit()` in a FastAPI endpoint for a real backend/API (a
-  first pass exists in the separate `webapp/` project).
+- Put the web app behind a domain with HTTPS, and move its job store out of
+  process memory (Redis or the existing SQLite database) so results survive
+  a restart and get a permanent link.
 - Add a `crawl` mode that audits multiple pages of a site for a site-wide score.
 - Extend `postprocess.py`'s deterministic-reconciliation pattern to other
   recurring hallucination classes as they're discovered.
@@ -580,5 +698,6 @@ than training on an unusable split.
 - Wire the Critic-Approval Predictor into the live pipeline once its real
   dataset is large and balanced enough — e.g. flagging a low predicted
   approval probability before spending an actual critic call.
-- Hook `python main.py eval` (and `analyze`) into CI so a regression gets
-  caught automatically, not just when someone notices in a manual run.
+- Hook `python main.py eval` (and `analyze`) into CI as a scheduled job — the
+  unit tests already run on every push, but `eval` exercises the real pipeline
+  against live sites and needs API quota.
