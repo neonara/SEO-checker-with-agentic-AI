@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+venv
+.venv
+**/__pycache__
+.pytest_cache
+.remember
+graphify-out
+.playwright-mcp

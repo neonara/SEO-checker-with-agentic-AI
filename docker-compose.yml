@@ -1,0 +1,36 @@
+# Fixed project name, so containers and the data volume keep the same names
+# whatever directory this is checked out into.
+name: seo-checker
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: seo-checker:latest
+    # Optional so the test service (and CI) work without a .env; the app
+    # itself cannot run audits without GROQ_API_KEY / GROQ_API_KEYS in it.
+    # (`required` needs Docker Compose >= 2.24.)
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${APP_PORT:-3003}:8000"
+    volumes:
+      # Live audit history. Seeded from the image's data/ on first start.
+      - seo_data:/app/data
+    restart: unless-stopped
+
+  # docker compose run --rm --build test
+  # Behind a profile so `docker compose up` (and the VPS) never builds or
+  # starts it. No network: the suite is meant to run fully offline.
+  test:
+    build:
+      context: .
+      target: test
+    image: seo-checker-test:latest
+    profiles: ["test"]
+    network_mode: "none"
+
+volumes:
+  seo_data:

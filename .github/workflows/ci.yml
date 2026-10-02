@@ -1,0 +1,115 @@
+name: CI
+
+# main  -> tests only. Integration branch: merge and test here, never deploys.
+# prod  -> tests, then deploy to the VPS. To release: merge main into prod.
+on:
+  push:
+    branches: [main, prod]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a prod run half-way through a deploy.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/prod' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same command as locally: the suite runs inside the image, offline.
+      - name: Run tests
+        run: docker compose run --rm --build test
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/prod' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      # Optional: pin the server's host key instead of trusting whatever
+      # answers on first contact (output of `ssh-keyscan <host>`).
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+      VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT || '22' }}
+      VPS_PATH: ${{ vars.VPS_PATH || '/opt/seo-checker' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          for name in VPS_HOST VPS_USER VPS_SSH_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is not set (repo Settings -> Secrets and variables -> Actions)."
+              exit 1
+            fi
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$VPS_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$VPS_SSH_PORT" -H "$VPS_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName $VPS_HOST
+            User $VPS_USER
+            Port $VPS_SSH_PORT
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+
+      # .env is excluded, so --delete never removes the server's secrets.
+      # The live database is in a Docker volume, not in this directory.
+      - name: Copy the code to the VPS
+        run: |
+          ssh vps "mkdir -p '$VPS_PATH'"
+          rsync -az --delete \
+            --exclude '.git/' --exclude '.github/' --exclude '.env' \
+            ./ "vps:$VPS_PATH/"
+
+      # `up --build` builds the new image first and only then replaces the
+      # container, so a failed build leaves the running version untouched.
+      - name: Build and restart
+        run: |
+          ssh vps "VPS_PATH='$VPS_PATH' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$VPS_PATH"
+          if [ ! -f .env ]; then
+            echo "::error::$VPS_PATH/.env does not exist on the VPS. Create it from .env.example (it holds the Groq API keys) and re-run."
+            exit 1
+          fi
+          docker compose up -d --build --remove-orphans
+          # Only this project's superseded images; other projects on the box are left alone.
+          docker image prune -f --filter "label=org.opencontainers.image.title=seo-checker" >/dev/null
+
+          cid=$(docker compose ps -q app)
+          for attempt in $(seq 1 60); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' "$cid")
+            if [ "$status" = healthy ]; then
+              echo "Deployed and healthy."
+              docker compose ps app
+              exit 0
+            fi
+            [ "$status" = unhealthy ] && break
+            sleep 2
+          done
+          echo "::error::The new container did not become healthy (last status: $status)."
+          docker compose logs --tail 60 app
+          exit 1
+          REMOTE
