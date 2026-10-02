@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Same command as locally: the suite runs inside the image, offline.
       - name: Run tests
@@ -39,7 +39,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Registry login: the GHCR_PAT secret (a personal access token with
       # write:packages), as the user it belongs to. Without that secret this
@@ -83,7 +83,7 @@ jobs:
       VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT || '22' }}
       VPS_PATH: ${{ vars.VPS_PATH || '/opt/seo-checker' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up SSH
         run: |
