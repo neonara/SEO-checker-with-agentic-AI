@@ -40,9 +40,11 @@ valid, complete JSON; being concise matters more than being exhaustive.
 
 
 def critique(draft: dict, specialist_reports: dict, model: str = CRITIC_MODEL,
-             fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0, log_fn=None) -> dict:
+             fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0, log_fn=None,
+             deadline: float | None = None) -> dict:
     agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=model,
-                       fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index, log_fn=log_fn)
+                       fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index,
+                       log_fn=log_fn, deadline=deadline)
     draft = maybe_compact_report(draft, log_fn=log_fn)
     specialist_reports = maybe_compact_specialist_reports(specialist_reports, log_fn=log_fn)
     payload = {"draft_report": draft, "specialist_reports": specialist_reports}
@@ -58,6 +60,7 @@ def reflect_and_revise(
     fallback_model: str | None = FALLBACK_MODEL,
     starting_key_index: int = 0,
     log_fn=None,
+    deadline: float | None = None,
 ) -> tuple[dict, list[dict]]:
     """Run synthesizer -> critic -> (revise if needed) up to MAX_REFLECTION_ROUNDS times.
     Returns (final_report, reflection_log).
@@ -77,12 +80,14 @@ def reflect_and_revise(
     key_cycle = starting_key_index
 
     draft = run_synthesizer(url, specialist_reports, previous_audit, model=synthesizer_model,
-                             fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
+                             fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn,
+                             deadline=deadline)
     key_cycle += 1
 
     for round_num in range(1, MAX_REFLECTION_ROUNDS + 1):
         review = critique(draft, specialist_reports, model=critic_model,
-                           fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
+                           fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn,
+                           deadline=deadline)
         key_cycle += 1
         reflection_log.append({"round": round_num, "review": review})
 
@@ -109,7 +114,8 @@ def reflect_and_revise(
             "instructions": review.get("instructions_for_revision"),
         }
         draft = run_synthesizer(url, revised_reports, previous_audit, model=synthesizer_model,
-                                 fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
+                                 fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn,
+                                 deadline=deadline)
         key_cycle += 1
 
     return draft, reflection_log

@@ -295,3 +295,82 @@ class TestCallWithRetry:
         result = agent._call_with_retry(model="primary-model", messages=[])
         assert result.choices[0].message.content == "ok"
         assert sleep_calls == [pytest.approx(4.0, abs=0.01)]
+
+
+class TestKeyRotationWraps:
+    """Reproduces a real bug: rotation only ever moved forward
+    (`_key_index + 1 >= len(keys)` -> give up). Specialists are spread across
+    the keys round-robin, so every agent that started on the LAST key had no
+    key to rotate to, even with untouched quota on the first one."""
+
+    def _agent(self, **kw):
+        return base_agent.ToolAgent(name="T", system_prompt="s", model="primary-model", fallback_model=None, **kw)
+
+    def test_agent_starting_on_the_last_key_rotates_to_the_first(self, fake_groq_error_factory, fake_completion_factory, monkeypatch):
+        monkeypatch.setattr(base_agent, "GROQ_API_KEYS", ["key0", "key1"])
+        fresh_client = MagicMock()
+        fresh_client.chat.completions.create.side_effect = [fake_completion_factory("ok")]
+        monkeypatch.setattr(base_agent, "Groq", MagicMock(return_value=fresh_client))
+
+        agent = self._agent(starting_key_index=1)
+        agent._client = MagicMock()
+        agent._client.chat.completions.create.side_effect = [fake_groq_error_factory(429, "please try again in 2h0m0s")]
+
+        result = agent._call_with_retry(model="primary-model", messages=[])
+        assert result.choices[0].message.content == "ok"
+        assert agent._key_index == 0
+
+    def test_gives_up_after_trying_every_key_once(self, fake_groq_error_factory, monkeypatch):
+        monkeypatch.setattr(base_agent, "GROQ_API_KEYS", ["key0", "key1", "key2"])
+        exhausted = MagicMock()
+        exhausted.chat.completions.create.side_effect = fake_groq_error_factory(429, "please try again in 2h0m0s")
+        groq_ctor = MagicMock(return_value=exhausted)
+        monkeypatch.setattr(base_agent, "Groq", groq_ctor)
+
+        agent = self._agent(starting_key_index=1)
+        agent._client = exhausted
+        with pytest.raises(RuntimeError, match="quota"):
+            agent._call_with_retry(model="primary-model", messages=[])
+        assert exhausted.chat.completions.create.call_count == 3  # each key exactly once
+
+
+class TestDeadline:
+    def _agent(self, **kw):
+        return base_agent.ToolAgent(name="T", system_prompt="s", model="primary-model", fallback_model=None, **kw)
+
+    def test_does_not_sleep_past_the_deadline(self, fake_groq_error_factory, monkeypatch):
+        """A web audit used to sleep through rate-limit waits of up to 15
+        minutes each while holding one of the two scan slots."""
+        from agent.errors import AuditFailed
+        sleep_calls = []
+        monkeypatch.setattr(base_agent.time, "sleep", lambda s: sleep_calls.append(s))
+
+        agent = self._agent(deadline=base_agent.time.monotonic() + 30)
+        agent._client = MagicMock()
+        agent._client.chat.completions.create.side_effect = fake_groq_error_factory(429, "please try again in 5m0s")
+
+        with pytest.raises(AuditFailed) as excinfo:
+            agent._call_with_retry(model="primary-model", messages=[])
+        assert excinfo.value.code == "timeout"
+        assert sleep_calls == []
+
+    def test_no_model_call_is_started_after_the_deadline(self):
+        from agent.errors import AuditFailed
+        agent = self._agent(deadline=base_agent.time.monotonic() - 1)
+        agent._client = MagicMock()
+        with pytest.raises(AuditFailed):
+            agent._call_with_retry(model="primary-model", messages=[])
+        agent._client.chat.completions.create.assert_not_called()
+
+    def test_short_wait_inside_the_deadline_still_sleeps(self, fake_groq_error_factory, fake_completion_factory, monkeypatch):
+        sleep_calls = []
+        monkeypatch.setattr(base_agent.time, "sleep", lambda s: sleep_calls.append(s))
+        agent = self._agent(deadline=base_agent.time.monotonic() + 600)
+        agent._client = MagicMock()
+        agent._client.chat.completions.create.side_effect = [
+            fake_groq_error_factory(429, "please try again in 3s"), fake_completion_factory("ok")]
+        assert agent._call_with_retry(model="primary-model", messages=[]).choices[0].message.content == "ok"
+        assert len(sleep_calls) == 1
+
+    def test_no_deadline_means_no_limit(self):
+        assert self._agent()._out_of_time(10_000) is False

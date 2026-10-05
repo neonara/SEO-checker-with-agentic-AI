@@ -144,3 +144,11 @@ def tmp_db_path(tmp_path, monkeypatch):
     db_path = tmp_path / "audit_history.db"
     monkeypatch.setattr(memory_module, "DB_PATH", str(db_path))
     return str(db_path)
+
+
+@pytest.fixture(autouse=True)
+def _no_background_lighthouse(monkeypatch):
+    """run_full_audit warms the Lighthouse cache in a background thread.
+    Nothing in the suite may reach the network, so that is a no-op here;
+    tests of the prefetch itself call agent.tools._get_lighthouse_data."""
+    monkeypatch.setattr("agent.tools.prefetch_lighthouse", lambda *a, **k: None)

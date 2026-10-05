@@ -23,12 +23,15 @@ test stale code. A real audit needs `GROQ_API_KEY` or `GROQ_API_KEYS` in
 ## How an audit flows
 
 ```
-planner -> specialists (concurrent, tool-calling) -> postprocess.py (deterministic fact-check)
-        -> synthesizer <-> critic (reflection loop) -> orchestrator.py reconciliation -> SQLite
+planner (a rule) -> specialists (concurrent, tool-calling) -> postprocess.py (deterministic fact-check)
+        -> evidence gate -> synthesizer <-> critic (reflection loop) -> orchestrator.py reconciliation -> SQLite
 ```
 
 - `agent/orchestrator.py` — the pipeline and the final deterministic fixes
-  (score recomputed from category weights, empty categories recovered or dropped).
+  (fixed category weights, score recomputed from them, Lighthouse-measured
+  scores pinned, empty categories recovered or dropped and listed as skipped).
+  Raises `AuditFailed` (`agent/errors.py`) instead of grading a blocked or
+  mostly-failed scan.
 - `agent/base_agent.py` — the agent loop: rate-limit handling, model fallback,
   API-key rotation, payload shrinking, JSON repair.
 - `agent/tools.py` — everything that touches the network (fetch, SSL, links,
@@ -50,10 +53,17 @@ planner -> specialists (concurrent, tool-calling) -> postprocess.py (determinist
   run before the first `import agent` (see the top of `main.py` and `api.py`).
 - **Exactly one uvicorn worker.** `api.py` keeps jobs and rate-limit counters
   in process memory. More workers means lost jobs and a multiplied rate limit.
-- **Tool caches are per-audit.** `tools._page_cache` / `_lighthouse_cache`
-  share data between one audit's specialists. `api.py` clears them when no
-  audit is running; any other long-lived caller must do the same or
-  re-audits get scored on stale data.
+- **Tool caches are per-audit.** `tools._page_cache`, `_fetch_result_cache`,
+  `_lighthouse_cache` and `_lighthouse_errors` share data (and a failed
+  Lighthouse call) between one audit's specialists. `api.py` empties them
+  with `tools.clear_caches()` when no audit is running; any other long-lived
+  caller must do the same or re-audits get scored on stale data. Tests that
+  touch the tools reset with `tools.clear_caches()`, not one cache.
+- **A job id is also the stored report's public id.** `api.py` passes it to
+  `run_full_audit(audit_id=...)`; `GET /api/audit/{id}` falls back to SQLite
+  when the job is no longer in memory. Row ids are never exposed.
+- **Visitors only see `AuditFailed.public_message` or a fixed text.** Raw
+  exceptions and unredacted progress lines go to the server log.
 - **Report text is untrusted.** It is written by a model reading someone
   else's website. The page inserts it as text nodes only — never `innerHTML`.
 - **`SEO_AGENT_BLOCK_PRIVATE_HOSTS=1` must stay on for anything public.** The

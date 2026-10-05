@@ -249,6 +249,8 @@ def reconcile_likely_blocked(specialist_result: dict, tool_call_log: list[dict],
             f"the real site."
         )
 
+    specialist_result["_likely_blocked"] = True
+    specialist_result["_blocked_status"] = status
     specialist_result["score"] = None
     specialist_result["findings"] = [{
         "severity": "critical",
@@ -289,6 +291,22 @@ def _latest_cwv_result(tool_call_log: list[dict]) -> dict | None:
     return None
 
 
+def _pin_measured_score(specialist_result: dict, measured, log_fn=None) -> None:
+    """Lighthouse already scored this category 0-100. Use that number as the
+    category score instead of the model's own estimate, which moves between
+    runs on an unchanged site. Recorded under `_measured_score` too, so the
+    orchestrator can re-apply it over whatever the synthesizer writes.
+    Skipped for a blocked result, whose score is deliberately empty."""
+    if not isinstance(measured, (int, float)) or specialist_result.get("_likely_blocked"):
+        return
+    claimed = specialist_result.get("score")
+    if log_fn and isinstance(claimed, (int, float)) and abs(claimed - measured) >= 1:
+        log_fn(f"  -> '{specialist_result.get('category', '?')}' score set to the measured "
+               f"Lighthouse score {measured} (model said {claimed}).")
+    specialist_result["score"] = measured
+    specialist_result["_measured_score"] = measured
+
+
 def reconcile_core_web_vitals(specialist_result: dict, tool_call_log: list[dict], log_fn=None) -> dict:
     """No-op if check_core_web_vitals wasn't called or failed. If it
     succeeded but the specialist's findings don't cite the real numbers,
@@ -298,6 +316,13 @@ def reconcile_core_web_vitals(specialist_result: dict, tool_call_log: list[dict]
         return specialist_result
 
     lab = cwv.get("lab_data", {})
+    # Set whenever the tool succeeded, not only when a finding gets injected
+    # below: the orchestrator reads this to correct a stale "no real Core Web
+    # Vitals data" note, and that note is just as wrong when the model did
+    # cite the real numbers.
+    specialist_result["_real_cwv_available"] = True
+    _pin_measured_score(specialist_result, lab.get("performance_score_0_100"), log_fn)
+
     findings = specialist_result.get("findings", [])
     findings_text = " ".join(
         f"{f.get('issue', '')} {f.get('recommendation', '')}" for f in findings
@@ -331,7 +356,6 @@ def reconcile_core_web_vitals(specialist_result: dict, tool_call_log: list[dict]
     }
     findings.append(canonical)
     specialist_result["findings"] = findings
-    specialist_result["_real_cwv_available"] = True
 
     if log_fn:
         log_fn(
@@ -506,6 +530,8 @@ def _reconcile_lighthouse_category_data(
         return specialist_result
 
     score = tool_result.get(score_field)
+    _pin_measured_score(specialist_result, score, log_fn)
+
     findings = specialist_result.get("findings", [])
     findings_text = " ".join(
         f"{f.get('issue', '')} {f.get('recommendation', '')}" for f in findings

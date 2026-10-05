@@ -237,7 +237,8 @@ the site's score history.
 | Route | Purpose |
 |---|---|
 | `POST /api/audit` | Start an audit: `{"url", "mode", "competitor_url"}` → `{"job_id"}` |
-| `GET /api/audit/{job_id}` | Poll: `status` (`running` / `done` / `error`), live `logs`, final `report` |
+| `GET /api/audit/{job_id}` | Poll: `status` (`running` / `done` / `error`), live `logs`, final `report`; on `error`, a visitor-safe `error` and an `error_code` (`blocked`, `too_few_checks`, `quota`, `timeout`, `internal`) |
+| `GET /api/audit/{job_id}/pdf` | The finished report as a PDF |
 | `GET /api/history/{domain}` | Past scores for a domain |
 | `GET /api/health` | Liveness, used by the container health check |
 
@@ -252,9 +253,15 @@ limited (all adjustable in `.env`, see Configuration):
   Every audit spends shared Groq free-tier quota.
 - Asking for an audit that is already running returns the running job.
 
-Jobs live in the server's memory: results stay retrievable for an hour and
-are lost on restart (the audit itself is still saved to the history
-database). This is also why the server runs exactly one worker.
+Running jobs live in the server's memory, which is why the server runs
+exactly one worker; a scan still running when the server restarts is lost.
+A finished report is stored in the history database under its job id, so
+its link keeps working after a restart and after the in-memory job expires.
+
+An audit that cannot be graded honestly ends as an error instead of a
+report: the site blocked the scanner, too few checks finished, the models
+ran out of quota, or the time budget ran out. A report that did finish lists
+any check that did not run under `skipped_categories`.
 
 ## Usage (CLI)
 
@@ -334,7 +341,7 @@ print(report["overall_score"], report["grade"], report["review_status"])
 │   ├── base_agent.py          the agentic loop runtime: rate-limit/quota handling, model
 │   │                          fallback, API-key rotation, payload shrinking, JSON self-repair
 │   ├── specialists.py         specialist system prompts + tool assignments
-│   ├── planner.py             planning agent
+│   ├── planner.py             which specialists run (a rule, not a model call)
 │   ├── synthesizer.py         synthesizer agent
 │   ├── critic.py              critic agent + reflection loop controller
 │   ├── postprocess.py         the deterministic fact-checking layer -- see "How this project
@@ -408,7 +415,7 @@ All overridable via environment variables (see `.env.example`):
 | `GROQ_API_KEYS` | — (optional) | Comma-separated list of multiple keys; specialists and synthesizer/critic calls round-robin across them for the whole run |
 | `GOOGLE_PAGESPEED_API_KEY` | — (optional) | Raises the rate limit on real Lighthouse audits; works without one at a lower limit |
 | `SEO_AGENT_MODEL` | `openai/gpt-oss-120b` | Primary model used by specialists, synthesizer |
-| `SEO_AGENT_PLANNER_MODEL` | same as above | Model for the planner agent |
+| `SEO_AGENT_PLANNER_MODEL` | same as above | Unused: the planner is a rule in code now (`agent/planner.py`) |
 | `SEO_AGENT_CRITIC_MODEL` | same as above | Model for the critic agent |
 | `SEO_AGENT_FALLBACK_MODEL` | `openai/gpt-oss-20b` | Used automatically on a rate/quota limit (separate quota pool); empty disables fallback |
 | `SEO_AGENT_COMPETITIVE_MODEL` | `groq/compound-mini` | Competitive specialist only. Groq shut Compound down on 2026-09-21, so this section is currently skipped in auto/deep mode until `browser_search` is wired in |
@@ -426,7 +433,9 @@ All overridable via environment variables (see `.env.example`):
 | `APP_PORT` | 3003 | Host port the web app is published on (docker compose) |
 | `SEO_API_RATE_LIMIT_PER_HOUR` | 5 | Audits one visitor IP may start per hour; 0 disables |
 | `SEO_API_MAX_CONCURRENT` | 2 | Audits allowed to run at once |
-| `SEO_API_JOB_TTL_SECONDS` | 3600 | How long a finished job's result stays retrievable |
+| `SEO_API_JOB_TTL_SECONDS` | 3600 | How long a finished job (and its progress log) stays in memory; the report stays reachable from SQLite after that |
+| `SEO_API_AUDIT_TIMEOUT_SECONDS` | 600 | Time budget for one web audit; 0 disables |
+| `SEO_AGENT_MAX_PAGE_BYTES` | 5000000 | Most bytes read from any one fetched page, robots.txt or sitemap |
 | `SEO_API_CORS_ORIGINS` | — | Comma-separated origins allowed to call the API from another site |
 
 CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).

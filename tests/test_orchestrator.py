@@ -540,15 +540,22 @@ class TestFailedSpecialistPlaceholderDoesNotLeakRawJson:
             '  "raw_evidence_notes": "Failed to retrieve HTML"'
         )
 
-        with mock_patch("agent.orchestrator.run_planner", return_value={"specialists": ["technical_seo"], "reasoning": "t"}), \
+        # The other specialists succeed: an audit where too little came back
+        # is refused outright now (see TestRefusesToGradeWithoutEvidence).
+        with mock_patch("agent.orchestrator.run_planner", return_value={"specialists": ["technical_seo", "content", "security", "links"], "reasoning": "t"}), \
              mock_patch("agent.orchestrator.memory.get_last_audit", return_value=None), \
              mock_patch("agent.orchestrator.memory.save_audit", return_value=1):
 
-            fake_agent = MagicMock()
-            fake_agent.run.side_effect = RuntimeError(raw_json_blob)
-            fake_agent.tool_call_log = []
+            def fake_build_specialist(key, **kw):
+                agent = MagicMock()
+                agent.tool_call_log = []
+                if key == "technical_seo":
+                    agent.run.side_effect = RuntimeError(raw_json_blob)
+                else:
+                    agent.run.return_value = {"category": key, "score": 80, "findings": []}
+                return agent
 
-            with mock_patch("agent.orchestrator.build_specialist", return_value=fake_agent), \
+            with mock_patch("agent.orchestrator.build_specialist", side_effect=fake_build_specialist), \
                  mock_patch("agent.orchestrator.reflect_and_revise", return_value=(
                      {"url": "https://example.com", "overall_score": 0.0, "grade": "F", "summary": "s",
                       "categories": [], "quick_wins": [], "data_limitations": ""},
@@ -560,3 +567,222 @@ class TestFailedSpecialistPlaceholderDoesNotLeakRawJson:
         assert "{" not in notes
         assert "Invalid SSL certificate" not in notes
         assert "failed" in notes.lower()
+
+# --------------------------------------------------------------------------
+# Refusing to grade without evidence / reporting what did not run
+# --------------------------------------------------------------------------
+
+_APPROVED = [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}]
+_FINDING = {"severity": "warning", "issue": "Something real.", "recommendation": "Fix it."}
+
+
+def _patch_pipeline(monkeypatch, specialist_keys, build_specialist, draft, previous=None):
+    """Wire run_full_audit to fakes. Returns the list save_audit calls land in
+    and a counter of synthesis runs."""
+    saved, synth_calls = [], []
+    monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: previous)
+    monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report, **kw: saved.append(report) or 1)
+    monkeypatch.setattr(orchestrator, "run_planner", lambda *a, **kw: {"specialists": specialist_keys, "reasoning": "t"})
+    monkeypatch.setattr(orchestrator, "build_specialist", build_specialist)
+
+    def fake_reflect(*a, **kw):
+        synth_calls.append(1)
+        return draft, _APPROVED
+
+    monkeypatch.setattr(orchestrator, "reflect_and_revise", fake_reflect)
+    return saved, synth_calls
+
+
+def _blocked_fetch_log(status=403):
+    return [{"name": "fetch_page", "args": {"url": "https://example.com"},
+             "result": {"ok": True, "status_code": status, "likely_blocked": True}}]
+
+
+class TestRefusesToGradeWithoutEvidence:
+    """Reproduces a real gap: a site that blocked the scanner (or a run where
+    the specialists all failed) still went through the synthesizer, which
+    wrote an overall score with no category behind it. That invented grade
+    was returned as a finished report and saved as audit history."""
+
+    KEYS = ["technical_seo", "content", "performance", "security"]
+    INVENTED = {"url": "https://example.com", "overall_score": 72.0, "grade": "C", "summary": "s",
+                "categories": [], "quick_wins": [], "data_limitations": ""}
+
+    def test_blocked_site_fails_instead_of_shipping_an_invented_grade(self, monkeypatch):
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.run.return_value = {"category": key, "score": 15, "findings": [_FINDING]}
+            agent.tool_call_log = _blocked_fetch_log(403)
+            return agent
+
+        saved, synth_calls = _patch_pipeline(monkeypatch, self.KEYS, build, self.INVENTED)
+        with pytest.raises(orchestrator.AuditFailed) as excinfo:
+            orchestrator.run_full_audit("https://example.com", mode="quick")
+
+        assert excinfo.value.code == "blocked"
+        assert "403" in excinfo.value.public_message
+        assert synth_calls == [], "no model call should be spent synthesizing a blocked audit"
+        assert saved == [], "a blocked audit must not be stored as history"
+
+    def test_all_specialists_failing_fails_the_audit(self, monkeypatch):
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.run.side_effect = RuntimeError("model returned garbage: {raw}")
+            agent.tool_call_log = []
+            return agent
+
+        saved, synth_calls = _patch_pipeline(monkeypatch, self.KEYS, build, self.INVENTED)
+        with pytest.raises(orchestrator.AuditFailed) as excinfo:
+            orchestrator.run_full_audit("https://example.com", mode="quick")
+
+        assert excinfo.value.code == "too_few_checks"
+        assert "garbage" not in excinfo.value.public_message
+        assert synth_calls == [] and saved == []
+
+    def test_audit_failed_is_a_runtime_error_for_the_cli(self):
+        assert issubclass(orchestrator.AuditFailed, RuntimeError)
+
+
+class TestSkippedCategories:
+    def test_report_lists_the_checks_that_did_not_run(self, monkeypatch):
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.tool_call_log = []
+            if key == "links":
+                agent.run.side_effect = RuntimeError("boom")
+            else:
+                agent.run.return_value = {"category": key, "score": 80, "findings": [_FINDING]}
+            return agent
+
+        draft = {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+                 "categories": [
+                     {"name": name, "score": 80, "weight": 0.25, "findings": [_FINDING]}
+                     for name in ("Technical SEO", "On-Page Content", "Web Security")
+                 ] + [{"name": "Link Health", "score": None, "weight": 0.25, "findings": []}],
+                 "quick_wins": [], "data_limitations": ""}
+        _patch_pipeline(monkeypatch, ["technical_seo", "content", "security", "links"], build, draft)
+        report = orchestrator.run_full_audit("https://example.com", mode="quick")
+
+        assert report["skipped_categories"] == [
+            {"name": "Link Health", "reason": "The check failed to complete."},
+        ]
+        assert "boom" not in str(report["skipped_categories"])
+
+    def test_nothing_skipped_gives_an_empty_list(self, monkeypatch):
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.tool_call_log = []
+            agent.run.return_value = {"category": key, "score": 80, "findings": [_FINDING]}
+            return agent
+
+        draft = {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+                 "categories": [{"name": "Technical SEO", "score": 80, "weight": 1.0, "findings": [_FINDING]}],
+                 "quick_wins": [], "data_limitations": ""}
+        _patch_pipeline(monkeypatch, ["technical_seo"], build, draft)
+        assert orchestrator.run_full_audit("https://example.com", mode="quick")["skipped_categories"] == []
+
+
+class TestStableScores:
+    def _log(self):
+        return lambda msg: None
+
+    def test_known_categories_get_fixed_weights_whatever_the_model_chose(self):
+        """The synthesizer picked its own weights each run, so one unchanged
+        site scored differently between runs. Same scores, two different
+        model weightings -> must give the same overall score."""
+        def report(w_tech, w_speed):
+            return {"overall_score": 0, "categories": [
+                {"name": "Technical SEO", "score": 90.0, "weight": w_tech},
+                {"name": "Page Speed", "score": 40.0, "weight": w_speed},
+            ]}
+
+        a, b = report(0.8, 0.2), report(0.2, 0.8)
+        orchestrator._reconcile_overall_score(a, self._log())
+        orchestrator._reconcile_overall_score(b, self._log())
+        assert a["overall_score"] == b["overall_score"] == 67.5  # (90*.22 + 40*.18) / .40
+        assert abs(sum(c["weight"] for c in a["categories"]) - 1.0) < 0.01
+
+    def test_fixed_weights_cover_every_canonical_category_and_sum_to_one_without_competitive(self):
+        assert set(orchestrator.CATEGORY_WEIGHTS) == set(orchestrator.CANONICAL_CATEGORY_NAMES.values())
+        core = sum(w for name, w in orchestrator.CATEGORY_WEIGHTS.items()
+                   if name != orchestrator.CANONICAL_CATEGORY_NAMES["competitive"])
+        assert abs(core - 1.0) < 1e-9
+
+    def test_measured_lighthouse_score_overrides_the_draft(self):
+        report = {"categories": [{"name": "Page Speed", "score": 85, "findings": [_FINDING]},
+                                 {"name": "Technical SEO", "score": 70, "findings": [_FINDING]}]}
+        specialist_reports = {"performance": {"score": 43, "_measured_score": 43},
+                              "technical_seo": {"score": 60}}
+        orchestrator._pin_measured_scores(report, specialist_reports, self._log())
+        assert report["categories"][0]["score"] == 43
+        assert report["categories"][1]["score"] == 70  # nothing measured: the draft stands
+
+
+class TestTrendBaseline:
+    def test_previous_audit_without_a_numeric_score_gives_no_trend_and_no_crash(self, monkeypatch):
+        """A stored report can carry overall_score None; the delta arithmetic
+        used to raise TypeError at the very end of an otherwise finished audit."""
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.tool_call_log = []
+            agent.run.return_value = {"category": key, "score": 80, "findings": [_FINDING]}
+            return agent
+
+        draft = {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+                 "categories": [{"name": "Technical SEO", "score": 80, "weight": 1.0, "findings": [_FINDING]}],
+                 "quick_wins": [], "data_limitations": ""}
+        _patch_pipeline(monkeypatch, ["technical_seo"], build, draft,
+                        previous={"overall_score": None, "_timestamp": "2026-09-01T00:00:00+00:00"})
+        report = orchestrator.run_full_audit("https://example.com", mode="quick")
+        assert not report.get("trend")
+
+
+class TestPlannerAndFailureReasons:
+    def test_planner_is_a_rule_not_a_model_call(self, monkeypatch):
+        from agent import planner, base_agent
+        monkeypatch.setattr(base_agent.ToolAgent, "run", lambda *a, **k: pytest.fail("planner called a model"))
+        plan = planner.run_planner("https://example.com", None, has_history=False)
+        assert plan["specialists"] == planner.CORE_SPECIALISTS
+        with_rival = planner.run_planner("https://example.com", "https://rival.com", has_history=True)
+        assert with_rival["specialists"] == planner.CORE_SPECIALISTS + ["competitive"]
+
+    @pytest.mark.parametrize("exc, code", [
+        (RuntimeError("[X] hit a Groq rate/quota limit requiring a wait longer than 15 minutes"), "quota"),
+        (orchestrator.AuditFailed("timeout", "The scan ran out of time."), "timeout"),
+        (ValueError("something else"), "too_few_checks"),
+    ])
+    def test_audit_failure_names_the_real_cause(self, monkeypatch, exc, code):
+        """"Too few checks finished" is useless to a visitor when the actual
+        cause is our quota or our time budget -- and only those two give the
+        rate-limit slot back."""
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.run.side_effect = exc
+            agent.tool_call_log = []
+            return agent
+
+        _patch_pipeline(monkeypatch, ["technical_seo", "content", "security"], build, {})
+        with pytest.raises(orchestrator.AuditFailed) as excinfo:
+            orchestrator.run_full_audit("https://example.com", mode="quick")
+        assert excinfo.value.code == code
+
+    def test_report_records_how_it_was_run_and_is_saved_under_the_audit_id(self, monkeypatch):
+        def build(key, **kw):
+            agent = MagicMock()
+            agent.tool_call_log = []
+            agent.run.return_value = {"category": key, "score": 80, "findings": [_FINDING]}
+            return agent
+
+        draft = {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+                 "categories": [{"name": "Technical SEO", "score": 80, "weight": 1.0, "findings": [_FINDING]}],
+                 "quick_wins": [], "data_limitations": ""}
+        _patch_pipeline(monkeypatch, ["technical_seo"], build, draft)
+        saved_kwargs = {}
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report, **kw: saved_kwargs.update(kw) or 1)
+
+        report = orchestrator.run_full_audit("https://example.com", mode="quick",
+                                             competitor_url="https://rival.com", audit_id="f" * 32)
+        assert saved_kwargs == {"public_id": "f" * 32}
+        assert report["mode"] == "quick"
+        assert report["competitor_url"] == "https://rival.com"
+        assert isinstance(report["duration_seconds"], float)

@@ -16,6 +16,7 @@ import groq
 from groq import Groq
 
 from . import tools
+from .errors import AuditFailed
 from .config import DEFAULT_MODEL, MAX_TOOL_ITERATIONS, RATE_LIMIT_MAX_RETRIES, FALLBACK_MODEL, GROQ_API_KEYS
 
 TOOL_IMPL: dict[str, Callable[[dict], dict]] = {
@@ -115,6 +116,7 @@ class ToolAgent:
         max_output_tokens: int = 2048,
         starting_key_index: int = 0,
         log_fn: Callable[[str], None] | None = None,
+        deadline: float | None = None,
     ):
         self.name = name
         self.system_prompt = system_prompt
@@ -127,6 +129,10 @@ class ToolAgent:
         self._client = None
         self._key_index = starting_key_index % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
         self._original_model = model  # restored when rotating to a fresh API key
+        self._rotations_done = 0  # within the current _call_with_retry
+        # time.monotonic() value after which this agent must stop starting
+        # model calls or sleeping on a rate limit. None = no limit (the CLI).
+        self.deadline = deadline
         self.tool_call_log: list[dict] = []  # [{"name": ..., "args": ..., "result": ...}] for post-hoc verification
 
     @property
@@ -140,13 +146,26 @@ class ToolAgent:
         """Switch to the next configured GROQ_API_KEYS entry (a separate
         quota pool) and reset back to this agent's original model, since a
         fresh key means a fresh daily quota on the primary model too.
-        Returns False if there's no next key configured."""
-        if self._key_index + 1 >= len(GROQ_API_KEYS):
+        Wraps around: specialists are spread across the keys round-robin, so
+        an agent that started on the last key has to be able to move to the
+        first. Returns False once every other key has been tried during the
+        current call."""
+        if self._rotations_done >= len(GROQ_API_KEYS) - 1:
             return False
-        self._key_index += 1
+        self._rotations_done += 1
+        self._key_index = (self._key_index + 1) % len(GROQ_API_KEYS)
         self._client = None  # force recreation with the new key
         self.model = self._original_model
         return True
+
+    def _out_of_time(self, extra_seconds: float = 0.0) -> bool:
+        return self.deadline is not None and time.monotonic() + extra_seconds > self.deadline
+
+    def _timeout_error(self) -> AuditFailed:
+        return AuditFailed(
+            "timeout",
+            "The scan ran out of time. The models are busy or rate-limited right now.",
+        )
 
     def _call_with_retry(self, **kwargs):
         """Call the Groq API, handling failure modes in order of preference:
@@ -160,8 +179,11 @@ class ToolAgent:
         last_error = None
         fell_back = False
         shrink_attempts = 0
+        self._rotations_done = 0
 
         for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            if self._out_of_time():
+                raise self._timeout_error()
             try:
                 return self.client.chat.completions.create(**kwargs)
             except groq.APIStatusError as e:
@@ -217,6 +239,10 @@ class ToolAgent:
 
                 if attempt == RATE_LIMIT_MAX_RETRIES:
                     break
+                if self._out_of_time(wait):
+                    # Sleeping would outlast the audit's time budget; stop now
+                    # instead of holding a scan slot for a wait nobody sees end.
+                    raise self._timeout_error() from e
                 self.log(f"[{self.name}] rate limited, waiting {wait:.1f}s "
                           f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})...")
                 time.sleep(wait)

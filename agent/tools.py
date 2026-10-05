@@ -5,8 +5,11 @@ straight into a tool-result message for the agent loop.
 """
 from __future__ import annotations
 
+import os
+import re
 import ssl
 import socket
+import threading
 import certifi
 import time
 import json
@@ -24,11 +27,33 @@ USER_AGENT = (
 )
 DEFAULT_TIMEOUT = 10
 
+# Most a single response body may take in memory. The urls come from visitors
+# and from the model, so without a cap one link to a huge file is enough to
+# exhaust the server. Far above any real HTML page, robots.txt or sitemap.
+MAX_PAGE_BYTES = int(os.environ.get("SEO_AGENT_MAX_PAGE_BYTES", 5_000_000))
+
 # Server-side cache: url -> raw HTML. This exists so fetched HTML never has to
 # be sent through the model's context (which was previously blowing through
 # the free-tier token budget in one or two tool calls). Tools that need the
 # HTML look it up here instead of receiving it as a function argument.
 _page_cache: dict[str, str] = {}
+
+# url -> the result fetch_page already returned for it during this audit.
+# Every specialist starts with fetch_page on the same url; without this the
+# target was requested once per specialist (seven times an audit), which is
+# slower, more likely to trip bot protection halfway through, and could leave
+# specialists disagreeing about whether the site was blocked.
+_fetch_result_cache: dict[str, dict] = {}
+
+# One lock per cache key, so concurrent specialists asking for the same thing
+# wait for the first fetch instead of each starting their own.
+_key_locks: dict[tuple, threading.Lock] = {}
+_key_locks_guard = threading.Lock()
+
+
+def _lock_for(*key) -> threading.Lock:
+    with _key_locks_guard:
+        return _key_locks.setdefault(key, threading.Lock())
 
 # Status codes commonly returned by bot/WAF protection (Cloudflare "Are You
 # Human" challenges, rate limiters, etc.) rather than reflecting a genuine
@@ -73,7 +98,41 @@ def clear_caches() -> None:
     empty them between audits or a re-audit hours later would silently be
     scored on the first audit's stale data (and memory would only grow)."""
     _page_cache.clear()
+    _fetch_result_cache.clear()
     _lighthouse_cache.clear()
+    _lighthouse_errors.clear()
+    with _key_locks_guard:
+        _key_locks.clear()
+
+
+def _get_capped(url: str, timeout: float = DEFAULT_TIMEOUT, **kwargs):
+    """GET `url`, reading at most MAX_PAGE_BYTES of the body. Returns
+    (response, text, body_bytes_read, truncated)."""
+    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout, stream=True, **kwargs)
+    chunks, size, truncated = [], 0, False
+    # `timeout` only bounds each read, so a server trickling bytes could hold
+    # this open indefinitely; give the whole body a wall-clock budget too.
+    give_up_at = time.time() + timeout * 3
+    try:
+        for chunk in resp.iter_content(chunk_size=65536):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_PAGE_BYTES or time.time() > give_up_at:
+                truncated = True
+                break
+    finally:
+        resp.close()
+    body = b"".join(chunks)[:MAX_PAGE_BYTES]
+    # Trust a charset the server declared; otherwise assume UTF-8 (requests'
+    # own default for undeclared text/* is ISO-8859-1, which garbles most
+    # modern pages).
+    declared = "charset=" in (resp.headers.get("Content-Type") or "").lower()
+    encoding = resp.encoding if declared and isinstance(resp.encoding, str) else "utf-8"
+    try:
+        text = body.decode(encoding, errors="replace")
+    except LookupError:
+        text = body.decode("utf-8", errors="replace")
+    return resp, text, len(body), truncated
 
 
 def fetch_page(url: str) -> dict:
@@ -84,18 +143,23 @@ def fetch_page(url: str) -> dict:
     blocked = _blocked_reason(url)
     if blocked:
         return {"ok": False, "requested_url": url, "error": blocked}
+    with _lock_for("page", url):
+        cached = _fetch_result_cache.get(url)
+        if cached is not None and url in _page_cache:
+            return cached
+        result = _fetch_page_uncached(url)
+        if result.get("ok"):
+            _fetch_result_cache[url] = result
+        return result
+
+
+def _fetch_page_uncached(url: str) -> dict:
     try:
         start = time.time()
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=DEFAULT_TIMEOUT,
-            allow_redirects=True,
-            **_guard_kwargs(),
-        )
+        resp, text, body_bytes, truncated = _get_capped(url, allow_redirects=True, **_guard_kwargs())
         elapsed_ms = round((time.time() - start) * 1000, 1)
-        _page_cache[url] = resp.text
-        _page_cache[resp.url] = resp.text
+        _page_cache[url] = text
+        _page_cache[resp.url] = text
 
         result = {
             "ok": True,
@@ -105,7 +169,7 @@ def fetch_page(url: str) -> dict:
             "redirect_chain_length": len(resp.history),
             "status_code": resp.status_code,
             "response_time_ms": elapsed_ms,
-            "content_length_bytes": len(resp.content),
+            "content_length_bytes": body_bytes,
             "headers": dict(resp.headers),
             "note": "HTML fetched and cached server-side. Call parse_seo_elements(url=...) "
                     "with this same url to extract SEO signals -- do not request raw HTML.",
@@ -120,6 +184,12 @@ def fetch_page(url: str) -> dict:
                 f"block/challenge page, NOT the real page. Do NOT score or report on it as if "
                 f"it were the site's actual content -- report a single critical finding noting "
                 f"suspected blocking instead of a normal quality assessment."
+            )
+        if truncated:
+            result["truncated"] = True
+            result["truncated_note"] = (
+                f"The response was larger than {MAX_PAGE_BYTES} bytes; only the first part "
+                f"was read, so content_length_bytes is a lower bound."
             )
 
         return result
@@ -228,15 +298,14 @@ def fetch_robots_txt(domain_or_url: str) -> dict:
     if blocked:
         return {"ok": False, "url": robots_url, "error": blocked}
     try:
-        resp = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT,
-                            **_guard_kwargs())
+        resp, text, _, _ = _get_capped(robots_url, **_guard_kwargs())
         return {
             "ok": True,
             "url": robots_url,
             "status_code": resp.status_code,
             "exists": resp.status_code == 200,
-            "content": resp.text[:5000] if resp.status_code == 200 else None,
-            "mentions_sitemap": "sitemap:" in resp.text.lower() if resp.status_code == 200 else False,
+            "content": text[:5000] if resp.status_code == 200 else None,
+            "mentions_sitemap": "sitemap:" in text.lower() if resp.status_code == 200 else False,
         }
     except requests.exceptions.RequestException as e:
         return {"ok": False, "url": robots_url, "error": str(e)}
@@ -253,17 +322,16 @@ def fetch_sitemap(domain_or_url: str) -> dict:
         return {"ok": False, "exists": False, "error": blocked}
     for sitemap_url in candidates:
         try:
-            resp = requests.get(sitemap_url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT,
-                                **_guard_kwargs())
+            resp, text, _, _ = _get_capped(sitemap_url, **_guard_kwargs())
             if resp.status_code == 200 and "xml" in resp.headers.get("Content-Type", "").lower():
-                url_count = resp.text.count("<url>") + resp.text.count("<sitemap>")
+                url_count = text.count("<url>") + text.count("<sitemap>")
                 return {
                     "ok": True,
                     "url": sitemap_url,
                     "exists": True,
                     "status_code": resp.status_code,
                     "entry_count_estimate": url_count,
-                    "sample_content": resp.text[:2000],
+                    "sample_content": text[:2000],
                 }
         except requests.exceptions.RequestException:
             continue
@@ -373,10 +441,16 @@ PAGESPEED_API_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 # (performance, accessibility, best-practices, seo) and share one cached
 # response instead of each specialist paying for its own PSI call --
 # whichever tool runs first for a given url+strategy fetches it, the other
-# reads the cache. Not thread-safe against a rare double-fetch race if two
-# specialists hit this in the same instant, but that only costs one extra
-# API call, never a crash.
+# reads the cache.
 _lighthouse_cache: dict[tuple[str, str], dict] = {}
+
+# Why the PageSpeed call failed for a url+strategy during this audit. Three
+# specialists ask for the same Lighthouse run; once it has failed after its
+# retries, the others get this answer at once instead of each spending
+# another round of retries (minutes, on a timeout) on the same failure.
+_lighthouse_errors: dict[tuple[str, str], str] = {}
+
+_API_KEY_PARAM_RE = re.compile(r"key=[^&\s'\")]+")
 
 _ALL_LIGHTHOUSE_CATEGORIES = ["performance", "accessibility", "best-practices", "seo"]
 
@@ -385,15 +459,12 @@ def _fetch_lighthouse(url: str, strategy: str, categories: list[str]) -> dict:
     """Call the PageSpeed Insights API for the given Lighthouse categories,
     retrying transient 5xx errors. Returns {"ok": True, "data": <raw PSI
     JSON>} on success, or {"ok": False, "error": ...} on failure. Callers
-    are responsible for caching -- failures are never cached so a later
-    retry can succeed.
+    are responsible for caching.
 
     Google's own docs note transient 500 "Unable to process request, please
     wait a while and try again" errors are common for this API, especially
     on heavier/complex pages -- retried automatically here rather than
     relying on the model to notice and retry on its own."""
-    import os
-
     api_key = os.environ.get("GOOGLE_PAGESPEED_API_KEY")
     params = [("url", normalize_url(url)), ("strategy", strategy)]
     for category in categories:
@@ -412,12 +483,13 @@ def _fetch_lighthouse(url: str, strategy: str, categories: list[str]) -> dict:
                 return {"ok": True, "data": resp.json()}
 
             last_error = f"PageSpeed Insights API returned {resp.status_code}: {resp.text[:300]}"
-            if resp.status_code in (500, 502, 503, 504) and attempt < max_attempts:
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
                 time.sleep(retry_delay_seconds)
                 continue
             return {"ok": False, "error": last_error}
         except (requests.exceptions.RequestException, ValueError) as e:
-            last_error = str(e)
+            # A connection error's text quotes the request url, API key included.
+            last_error = _API_KEY_PARAM_RE.sub("key=***", str(e))
             if attempt < max_attempts:
                 time.sleep(retry_delay_seconds)
                 continue
@@ -430,18 +502,40 @@ def _get_lighthouse_data(url: str, strategy: str) -> dict | None:
     """Return the cached full-Lighthouse-run PSI response for this
     url+strategy, fetching (and caching on success only) if not already
     present. Returns None on failure -- callers build their own
-    tool-specific error response in that case."""
+    tool-specific error response in that case (see _lighthouse_error).
+    A failure is remembered until clear_caches(), i.e. for the rest of the
+    audit."""
     cache_key = (normalize_url(url), strategy)
-    cached = _lighthouse_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    with _lock_for("lighthouse", *cache_key):
+        cached = _lighthouse_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if cache_key in _lighthouse_errors:
+            return None
 
-    fetched = _fetch_lighthouse(url, strategy, _ALL_LIGHTHOUSE_CATEGORIES)
-    if not fetched.get("ok"):
-        return None
+        fetched = _fetch_lighthouse(url, strategy, _ALL_LIGHTHOUSE_CATEGORIES)
+        if not fetched.get("ok"):
+            _lighthouse_errors[cache_key] = fetched.get("error") or "unknown error"
+            return None
 
-    _lighthouse_cache[cache_key] = fetched["data"]
-    return fetched["data"]
+        _lighthouse_cache[cache_key] = fetched["data"]
+        return fetched["data"]
+
+
+def _lighthouse_error(url: str, strategy: str) -> str:
+    reason = _lighthouse_errors.get((normalize_url(url), strategy), "unknown error")
+    return f"PageSpeed Insights API call failed: {reason}"
+
+
+def prefetch_lighthouse(url: str, strategy: str = "mobile") -> None:
+    """Warm the Lighthouse cache. The orchestrator runs this in the
+    background as an audit starts: the PageSpeed call takes 10-30+ seconds,
+    and done here it overlaps with the first specialists instead of holding
+    up the one that asks for it."""
+    try:
+        _get_lighthouse_data(url, strategy)
+    except Exception:
+        pass  # the specialist's own call will report whatever is wrong
 
 
 def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
@@ -455,7 +549,7 @@ def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
     if data is None:
         return {
             "ok": False,
-            "error": "PageSpeed Insights API call failed (see logs for the underlying error).",
+            "error": _lighthouse_error(url, strategy),
             "note": "Real Core Web Vitals data unavailable this run -- fall back to the "
                     "proxy signals from fetch_page/parse_seo_elements instead.",
         }
@@ -557,7 +651,7 @@ def check_accessibility_and_best_practices(url: str, strategy: str = "mobile") -
     if data is None:
         return {
             "ok": False,
-            "error": "PageSpeed Insights API call failed (see logs for the underlying error).",
+            "error": _lighthouse_error(url, strategy),
             "note": "Real accessibility audit data unavailable this run.",
         }
 
@@ -600,7 +694,7 @@ def check_best_practices(url: str, strategy: str = "mobile") -> dict:
     if data is None:
         return {
             "ok": False,
-            "error": "PageSpeed Insights API call failed (see logs for the underlying error).",
+            "error": _lighthouse_error(url, strategy),
             "note": "Real best-practices audit data unavailable this run.",
         }
 
@@ -637,8 +731,10 @@ def check_links_status(urls: list[str]) -> dict:
             resp = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=6, allow_redirects=True,
                                  **_guard_kwargs())
             if resp.status_code >= 400:
+                # Only the status matters: stream and close, never download the body.
                 resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=6, allow_redirects=True,
-                                    **_guard_kwargs())
+                                    stream=True, **_guard_kwargs())
+                resp.close()
             results.append({"url": url, "status_code": resp.status_code, "broken": resp.status_code >= 400})
         except requests.exceptions.RequestException as e:
             results.append({"url": url, "status_code": None, "broken": True, "error": str(e)})

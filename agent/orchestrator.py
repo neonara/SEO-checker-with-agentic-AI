@@ -11,9 +11,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
+import threading
 import time
 
 from . import memory
+from . import tools
+from .errors import AuditFailed, is_quota_error
+from .planner import CORE_SPECIALISTS
 from .planner import run_planner
 from .specialists import build_specialist, SPECIALIST_DEFINITIONS
 from .critic import reflect_and_revise
@@ -68,9 +72,37 @@ CANONICAL_CATEGORY_NAMES = {
 }
 
 
-def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dict, key_index: int, log_fn) -> tuple[str, dict]:
+# Fixed category weights. The synthesizer used to pick these itself, so the
+# same unchanged site could score differently from one run to the next purely
+# because the model weighted things differently -- which also made the trend
+# between two audits partly noise. Renormalized over whichever categories
+# actually made it into the report.
+CATEGORY_WEIGHTS = {
+    "Technical SEO": 0.22,
+    "On-Page Content": 0.22,
+    "Page Speed": 0.18,
+    "Web Security": 0.12,
+    "Accessibility": 0.10,
+    "Link Health": 0.08,
+    "Best Practices": 0.08,
+    "Competitive & Industry Benchmarking": 0.05,
+}
+
+# An audit needs at least this many specialists to come back with a score
+# (or all of them, when fewer were planned). Below that there is too little
+# evidence to put a grade on a site.
+MIN_USABLE_SPECIALISTS = 3
+
+
+# Specialists whose data comes from the PageSpeed/Lighthouse run.
+LIGHTHOUSE_SPECIALISTS = {"performance", "accessibility", "best_practices"}
+
+
+def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dict, key_index: int, log_fn,
+                        deadline: float | None = None) -> tuple[str, dict]:
     model = cfg["competitive"] if key == "competitive" else cfg["primary"]
-    agent = build_specialist(key, log_fn=log_fn, model=model, fallback_model=cfg["fallback"], key_index=key_index)
+    agent = build_specialist(key, log_fn=log_fn, model=model, fallback_model=cfg["fallback"], key_index=key_index,
+                             deadline=deadline)
     task = f"Target URL: {url}"
     if key == "competitive" and competitor_url:
         task += f"\nCompetitor URL to compare against: {competitor_url}"
@@ -97,6 +129,10 @@ def _reconcile_overall_score(report: dict, log_fn) -> None:
     categories = report.get("categories") or []
     if not categories:
         return
+
+    for c in categories:
+        if c.get("name") in CATEGORY_WEIGHTS:
+            c["weight"] = CATEGORY_WEIGHTS[c["name"]]
 
     usable = [
         c for c in categories
@@ -133,6 +169,77 @@ def _reconcile_overall_score(report: dict, log_fn) -> None:
         log_fn(f"  -> Normalizing category weights: they summed to {round(total_weight, 3)}, not 1.0")
         for c in usable:
             c["weight"] = round(c["weight"] / total_weight, 3)
+
+
+def _require_enough_evidence(specialist_keys: list[str], specialist_reports: dict) -> None:
+    """Stop before synthesis when the specialists did not bring back enough
+    to grade. Observed gap: a site that blocked the scanner, or a run where
+    every specialist died on quota, still went through the synthesizer,
+    which wrote an overall score with no category behind it -- and that
+    invented score was shown to the visitor and saved as audit history."""
+    planned = len(specialist_keys)
+    blocked = [r for r in specialist_reports.values() if r.get("_likely_blocked")]
+    if blocked and len(blocked) * 2 >= planned:
+        status = blocked[0].get("_blocked_status")
+        raise AuditFailed(
+            "blocked",
+            f"This site blocked the scanner (it answered with HTTP {status}), so there is "
+            f"nothing reliable to grade. It usually means bot or firewall protection.",
+        )
+    usable = sum(1 for r in specialist_reports.values() if isinstance(r.get("score"), (int, float)))
+    if usable < min(MIN_USABLE_SPECIALISTS, planned):
+        reasons = {r.get("_failed_reason") for r in specialist_reports.values()}
+        if "timeout" in reasons:
+            raise AuditFailed(
+                "timeout",
+                "The scan ran out of time before enough checks could finish. The models are "
+                "busy or rate-limited right now.",
+            )
+        if "quota" in reasons:
+            raise AuditFailed(
+                "quota",
+                "The models ran out of free quota before enough checks could finish.",
+            )
+        raise AuditFailed(
+            "too_few_checks",
+            f"Only {usable} of {planned} checks finished, which is too few to grade the site.",
+        )
+
+
+def _pin_measured_scores(report: dict, specialist_reports: dict, log_fn) -> None:
+    """Where Lighthouse measured a category's score (postprocess records it
+    as `_measured_score`), that number wins over whatever the synthesizer
+    wrote for the category."""
+    reverse_canonical = {v: k for k, v in CANONICAL_CATEGORY_NAMES.items()}
+    for c in report.get("categories") or []:
+        source = specialist_reports.get(reverse_canonical.get(c.get("name")))
+        measured = source.get("_measured_score") if source else None
+        if isinstance(measured, (int, float)) and c.get("score") != measured:
+            log_fn(f"  -> '{c.get('name')}' score set to the measured Lighthouse score "
+                   f"{measured} (draft said {c.get('score')}).")
+            c["score"] = measured
+
+
+def _skipped_categories(report: dict, specialist_keys: list[str], specialist_reports: dict) -> list[dict]:
+    """Planned checks that are not in the final report, each with a fixed
+    reason. Without this a dropped category simply vanished and the reader
+    could not tell a clean result from a check that never ran."""
+    present = {c.get("name") for c in report.get("categories") or []}
+    skipped = []
+    for key in specialist_keys:
+        name = CANONICAL_CATEGORY_NAMES.get(key, key)
+        if name in present:
+            continue
+        source = specialist_reports.get(key) or {}
+        if source.get("_likely_blocked"):
+            reason = "The site blocked the scanner for this check."
+        elif source.get("_failed"):
+            reason = "The check failed to complete."
+        else:
+            reason = "The check returned no usable result."
+        skipped.append({"name": name, "reason": reason})
+    return skipped
+
 
 def _recover_or_drop_empty_categories(report: dict, specialist_reports: dict, log_fn) -> None:
     """A category with zero findings in the synthesized draft doesn't always
@@ -221,8 +328,16 @@ def run_full_audit(
     mode: str = "auto",
     log_fn: Callable[[str], None] | None = None,
     starting_key_index: int = 0,
+    audit_id: str | None = None,
+    deadline_seconds: float | None = None,
 ) -> dict:
+    """`audit_id`: public handle to store the report under (the API passes
+    its job id, so a finished report stays reachable at the same link after
+    the in-memory job is gone). `deadline_seconds`: time budget for the whole
+    audit; past it the agents stop and the audit raises AuditFailed."""
     log_fn = log_fn or (lambda msg: None)
+    started = time.time()
+    deadline = time.monotonic() + deadline_seconds if deadline_seconds else None
     cfg = MODE_CONFIGS.get(mode, MODE_CONFIGS["auto"])
     if mode not in MODE_CONFIGS:
         log_fn(f"  -> Unknown mode '{mode}', defaulting to 'auto'.")
@@ -241,8 +356,13 @@ def run_full_audit(
                         key_index=starting_key_index, log_fn=log_fn)
     specialist_keys = [k for k in plan.get("specialists", []) if k in SPECIALIST_DEFINITIONS]
     if not specialist_keys:
-        specialist_keys = ["technical_seo", "content", "performance", "security", "links", "accessibility", "best_practices"]
+        specialist_keys = list(CORE_SPECIALISTS)
     log_fn(f"  -> Plan: {specialist_keys} ({plan.get('reasoning', '')})")
+
+    if LIGHTHOUSE_SPECIALISTS & set(specialist_keys):
+        # The PageSpeed call takes 10-30+ seconds. Started now, it overlaps
+        # with the first specialists instead of stalling the one that asks.
+        threading.Thread(target=tools.prefetch_lighthouse, args=(url,), daemon=True).start()
 
     log_fn(f"Stage 2/4: Dispatching {len(specialist_keys)} specialist agents "
            f"(max {MAX_PARALLEL_SPECIALISTS} concurrent, staggered"
@@ -260,7 +380,8 @@ def run_full_audit(
             # caller running several audits in sequence doesn't have every
             # single one begin on the same key.
             key_index = (i + starting_key_index) % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
-            futures[pool.submit(_run_one_specialist, key, url, competitor_url, cfg, key_index, log_fn)] = key
+            futures[pool.submit(_run_one_specialist, key, url, competitor_url, cfg, key_index, log_fn,
+                                deadline)] = key
 
         for future in as_completed(futures):
             key = futures[future]
@@ -287,6 +408,9 @@ def run_full_audit(
                     "category": key,
                     "score": None,
                     "findings": [],
+                    "_failed": True,
+                    "_failed_reason": (e.code if isinstance(e, AuditFailed)
+                                       else "quota" if is_quota_error(e) else "error"),
                     "raw_evidence_notes": (
                         "This specialist failed to complete due to a technical/formatting "
                         "error. No reliable findings are available for this category -- do "
@@ -295,7 +419,8 @@ def run_full_audit(
                     ),
                 }
     had_real_cwv = any(r.get("_real_cwv_available") for r in specialist_reports.values())
-    
+    _require_enough_evidence(specialist_keys, specialist_reports)
+
     log_fn("Stage 3/4: Synthesizing + critiquing report (reflection loop)...")
     # Continue the same key rotation sequence right after the specialists,
     # rather than resetting back to key 0 -- synthesizer/critic run multiple
@@ -306,6 +431,7 @@ def run_full_audit(
         url, specialist_reports, previous_audit,
         synthesizer_model=cfg["primary"], critic_model=cfg["critic"],
         fallback_model=cfg["fallback"], starting_key_index=stage3_start_index, log_fn=log_fn,
+        **({"deadline": deadline} if deadline is not None else {}),
     )
 
     try:
@@ -314,9 +440,10 @@ def run_full_audit(
         log_fn(f"  -> WARNING: final report failed schema validation: {e}")
         final_report = draft  # surface the raw draft rather than crashing the whole run
 
-    _recover_or_drop_empty_categories(final_report, specialist_reports, log_fn)   # <-- was _drop_empty_categories(final_report, log_fn)
+    _pin_measured_scores(final_report, specialist_reports, log_fn)
+    _recover_or_drop_empty_categories(final_report, specialist_reports, log_fn)
     _reconcile_overall_score(final_report, log_fn)
-
+    final_report["skipped_categories"] = _skipped_categories(final_report, specialist_keys, specialist_reports)
 
     was_approved = bool(reflection_log) and reflection_log[-1].get("review", {}).get("approved")
     if not was_approved:
@@ -332,11 +459,15 @@ def run_full_audit(
     final_report["_specialist_reports"] = specialist_reports
     final_report["_reflection_log"] = reflection_log
 
-    if previous_audit:
+    # A stored report can carry a non-numeric score (older runs kept whatever
+    # the model wrote when no category survived); that is no baseline.
+    previous_score = previous_audit.get("overall_score") if previous_audit else None
+    current_score = final_report.get("overall_score")
+    if isinstance(previous_score, (int, float)) and isinstance(current_score, (int, float)):
         final_report["trend"] = {
-            "previous_score": previous_audit.get("overall_score"),
+            "previous_score": previous_score,
             "previous_timestamp": previous_audit.get("_timestamp"),
-            "score_delta": round(final_report.get("overall_score", 0) - previous_audit.get("overall_score", 0), 1),
+            "score_delta": round(current_score - previous_score, 1),
         }
         fix_summary_trend_mismatch(final_report, log_fn)
     else:
@@ -344,8 +475,12 @@ def run_full_audit(
 
     fix_stale_cwv_data_limitations(final_report, had_real_cwv, log_fn)
 
+    final_report["mode"] = mode
+    final_report["competitor_url"] = competitor_url
+    final_report["duration_seconds"] = round(time.time() - started, 1)
+
     log_fn("Stage 4/4: Saving to persistent memory...")
     if use_memory:
-        memory.save_audit(url, final_report)
+        memory.save_audit(url, final_report, **({"public_id": audit_id} if audit_id else {}))
 
     return final_report

@@ -20,12 +20,17 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import time
 from urllib.parse import urlparse
 
 ALLOWED_SCHEMES = ("http", "https")
 # Default web ports plus the common alternates. Anything else is far more
 # likely to be a probe of a non-web service than a site someone wants audited.
 ALLOWED_PORTS = {80, 443, 8080, 8443}
+# A lookup that times out (EAI_AGAIN) says nothing about whether the site
+# exists: slow nameservers do it routinely. Tried this many times in all.
+DNS_ATTEMPTS = 3
+DNS_RETRY_DELAY = 0.5
 
 
 def enabled() -> bool:
@@ -46,10 +51,18 @@ def check_host(hostname: str) -> str | None:
     hostname = (hostname or "").strip().strip("[]").rstrip(".")
     if not hostname:
         return "URL has no hostname."
-    try:
-        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-    except (socket.gaierror, UnicodeError):
-        return f"No website found at '{hostname}'. Check the spelling."
+    for attempt in range(1, DNS_ATTEMPTS + 1):
+        try:
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+            break
+        except socket.gaierror as e:
+            if e.errno != socket.EAI_AGAIN:
+                return f"No website found at '{hostname}'. Check the spelling."
+            if attempt == DNS_ATTEMPTS:
+                return f"Could not look up '{hostname}' right now. Try again in a moment."
+            time.sleep(DNS_RETRY_DELAY)
+        except UnicodeError:
+            return f"No website found at '{hostname}'. Check the spelling."
     addresses = {info[4][0].split("%")[0] for info in infos}
     if not addresses:
         return f"No website found at '{hostname}'. Check the spelling."

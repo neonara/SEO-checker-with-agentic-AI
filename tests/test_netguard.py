@@ -75,6 +75,29 @@ class TestCheckHost:
         monkeypatch.setattr(netguard.socket, "getaddrinfo", boom)
         assert "No website found" in netguard.check_host("nope.invalid")
 
+    def test_dns_timeout_is_retried_not_reported_as_missing_site(self, monkeypatch):
+        # cjdevent.tn: a live site whose nameserver answered slowly, so the
+        # first lookup timed out and the visitor was told to check the spelling.
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+            return resolves_to("51.254.132.203")(*args, **kwargs)
+        monkeypatch.setattr(netguard.socket, "getaddrinfo", flaky)
+        monkeypatch.setattr(netguard.time, "sleep", lambda s: None)
+        assert netguard.check_host("cjdevent.tn") is None
+        assert len(calls) == 2
+
+    def test_dns_timeout_on_every_attempt_is_refused_as_temporary(self, monkeypatch):
+        def down(*args, **kwargs):
+            raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+        monkeypatch.setattr(netguard.socket, "getaddrinfo", down)
+        monkeypatch.setattr(netguard.time, "sleep", lambda s: None)
+        reason = netguard.check_host("cjdevent.tn")
+        assert "Try again" in reason and "No website found" not in reason
+
     def test_empty_hostname_is_refused(self):
         assert netguard.check_host("") == "URL has no hostname."
 

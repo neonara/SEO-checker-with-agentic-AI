@@ -1,895 +1,323 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SEO Health Agent</title>
-<meta name="description" content="Paste a web address and get a graded SEO and site-health report.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='12' fill='none' stroke='%231F4FE0' stroke-width='5' stroke-dasharray='58 76' stroke-linecap='round' transform='rotate(-90 16 16)'/%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,500..800&family=Public+Sans:wght@400;500;600;700&display=swap">
-<script>
-  // Before first paint: a saved light/dark choice wins over the system setting.
-  try {
-    var saved = localStorage.getItem("theme");
-    if (saved === "dark" || saved === "light") document.documentElement.dataset.theme = saved;
-  } catch (e) { /* storage unavailable: follow the system */ }
-</script>
-<style>
-:root {
-  --paper: #F6F8FB;
-  --surface: #FFFFFF;
-  --ink: #0E1B2E;
-  --muted: #5B6B82;
-  --line: #D9E0EA;
-  --accent: #1F4FE0;
-  --accent-ink: #FFFFFF;
-  --accent-soft: #E7EDFD;
-  --good: #12805C;
-  --warning: #A86200;
-  --critical: #C4302B;
-  --good-soft: #E3F3EC;
-  --warning-soft: #FBF0DC;
-  --critical-soft: #FBE9E8;
-  --grade-a: #12805C;
-  --grade-b: #4A7F1C;
-  --grade-c: #A86200;
-  --grade-d: #C2500C;
-  --grade-f: #C4302B;
-  --log-bg: #0E1B2E;
-  --log-ink: #C9D6EA;
-  --display: "Bricolage Grotesque", "Public Sans", system-ui, sans-serif;
-  --body: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  color-scheme: light;
-}
-/* Dark palette, twice: when the system asks for it and the visitor has not
-   chosen light, and when the visitor has chosen dark with the toggle. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --paper: #0A1320;
-    --surface: #111D2F;
-    --ink: #E8EEF7;
-    --muted: #94A3B8;
-    --line: #25344B;
-    --accent: #86A2FF;
-    --accent-ink: #0A1320;
-    --accent-soft: #1A2A4A;
-    --good: #4CC79A;
-    --warning: #E6A93C;
-    --critical: #F2817B;
-    --good-soft: #12302A;
-    --warning-soft: #33280F;
-    --critical-soft: #391B1C;
-    --grade-a: #4CC79A;
-    --grade-b: #9BCB5A;
-    --grade-c: #E6A93C;
-    --grade-d: #F0935A;
-    --grade-f: #F2817B;
-    --log-bg: #060C16;
-    --log-ink: #B8C6DC;
-    color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --paper: #0A1320;
-  --surface: #111D2F;
-  --ink: #E8EEF7;
-  --muted: #94A3B8;
-  --line: #25344B;
-  --accent: #86A2FF;
-  --accent-ink: #0A1320;
-  --accent-soft: #1A2A4A;
-  --good: #4CC79A;
-  --warning: #E6A93C;
-  --critical: #F2817B;
-  --good-soft: #12302A;
-  --warning-soft: #33280F;
-  --critical-soft: #391B1C;
-  --grade-a: #4CC79A;
-  --grade-b: #9BCB5A;
-  --grade-c: #E6A93C;
-  --grade-d: #F0935A;
-  --grade-f: #F2817B;
-  --log-bg: #060C16;
-  --log-ink: #B8C6DC;
-  color-scheme: dark;
-}
-:root[data-theme="light"] { color-scheme: light; }
-
-*, *::before, *::after { box-sizing: border-box; }
-[hidden] { display: none !important; }
-html { -webkit-text-size-adjust: 100%; }
-body {
-  margin: 0;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--paper);
-  color: var(--ink);
-  font: 400 1rem/1.55 var(--body);
-}
-button, input, select { font: inherit; color: inherit; }
-a { color: var(--accent); }
-:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-
-.wrap { width: 100%; max-width: 60rem; margin-inline: auto; padding-inline: 1.25rem; }
-
-/* Top bar */
-.bar { border-bottom: 1px solid var(--line); background: var(--surface); }
-.bar .wrap { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 3.5rem; }
-.wordmark {
-  display: inline-flex; align-items: center; gap: .55rem;
-  background: none; border: 0; padding: .25rem 0; cursor: pointer;
-  font: 700 1.125rem/1 var(--display); font-stretch: 90%; letter-spacing: -.01em;
-}
-.wordmark svg { width: 1.5rem; height: 1.5rem; }
-.theme-toggle {
-  display: grid; place-items: center; flex: none; width: 2.5rem; height: 2.5rem; padding: 0;
-  border: 1px solid var(--line); border-radius: .5rem; background: var(--surface); cursor: pointer;
-}
-.theme-toggle:hover { border-color: var(--accent); }
-.theme-toggle svg { width: 1.25rem; height: 1.25rem; }
-/* The icon shows the mode the button switches TO. */
-.theme-toggle[data-mode="dark"] .to-dark, .theme-toggle[data-mode="light"] .to-light { display: none; }
-
-main { flex: 1; }
-
-/* Shared controls */
-.btn {
-  display: inline-flex; align-items: center; justify-content: center;
-  min-height: 2.75rem; padding: 0 1.15rem;
-  border: 1px solid var(--line); border-radius: .5rem;
-  background: var(--surface); font-weight: 600; cursor: pointer;
-}
-.btn:hover { border-color: var(--accent); }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-.btn-primary:hover { filter: brightness(1.08); }
-.btn[disabled] { opacity: .6; cursor: progress; }
-
-/* Home */
-.home { padding-block: clamp(3rem, 12vh, 7rem) 4rem; text-align: center; }
-.home h1 {
-  margin: 0 0 .75rem;
-  font: 700 clamp(2.25rem, 6vw, 3.5rem)/1.05 var(--display);
-  font-stretch: 85%; letter-spacing: -.02em;
-}
-.home .lede { max-width: 34rem; margin: 0 auto 2rem; color: var(--muted); font-size: 1.0625rem; }
-.scan { max-width: 40rem; margin-inline: auto; text-align: left; }
-.scan-row {
-  display: flex; gap: .5rem; padding: .4rem;
-  background: var(--surface); border: 1px solid var(--line); border-radius: .75rem;
-}
-.scan-row:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.scan-row input {
-  flex: 1; min-width: 0; min-height: 2.75rem; padding: 0 .75rem;
-  border: 0; background: transparent; font-size: 1.0625rem;
-}
-.scan-row input:focus { outline: none; }
-.scan-row input::placeholder { color: var(--muted); }
-.form-error {
-  margin: .75rem 0 0; padding: .6rem .8rem; border-radius: .5rem;
-  background: var(--critical-soft); color: var(--critical); font-weight: 500;
-}
-.options { margin-top: 1rem; color: var(--muted); }
-.options summary { cursor: pointer; width: fit-content; font-weight: 500; }
-.options-body { display: grid; gap: 1rem; margin-top: 1rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
-.field label, .field legend { display: block; margin-bottom: .35rem; padding: 0; font-weight: 600; color: var(--ink); }
-.field input[type="text"], .field select {
-  width: 100%; min-height: 2.75rem; padding: 0 .7rem;
-  border: 1px solid var(--line); border-radius: .5rem; background: var(--surface);
-}
-.field .hint { margin: .35rem 0 0; font-size: .875rem; }
-
-/* Running */
-.running, .failed { padding-block: 2.5rem 4rem; }
-.running h1, .failed h1 { margin: 0 0 .25rem; font: 700 1.75rem/1.2 var(--display); font-stretch: 90%; }
-.target { margin: 0 0 2rem; color: var(--muted); overflow-wrap: anywhere; }
-.steps { list-style: none; margin: 0 0 2rem; padding: 0; display: grid; gap: .5rem; grid-template-columns: repeat(4, 1fr); counter-reset: step; }
-.steps li {
-  counter-increment: step; padding: .85rem .9rem;
-  background: var(--surface); border: 1px solid var(--line); border-radius: .6rem;
-  color: var(--muted);
-}
-.steps li::before {
-  content: counter(step); display: block; margin-bottom: .35rem;
-  font: 700 1.25rem/1 var(--display); font-variant-numeric: tabular-nums;
-}
-.steps b { display: block; font-weight: 600; }
-.steps small { display: block; font-size: .8125rem; min-height: 1.2em; }
-.steps li[data-state="active"] { border-color: var(--accent); color: var(--ink); box-shadow: inset 0 3px 0 var(--accent); }
-.steps li[data-state="active"]::before { color: var(--accent); }
-.steps li[data-state="done"] { color: var(--ink); }
-.steps li[data-state="done"]::before { content: "\2713"; color: var(--good); }
-.log-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; margin-bottom: .5rem; }
-.log-head h2 { margin: 0; font: 600 1rem/1.3 var(--body); }
-.log-head span { color: var(--muted); font-variant-numeric: tabular-nums; }
-.log {
-  margin: 0; padding: 1rem; height: 18rem; overflow: auto;
-  background: var(--log-bg); color: var(--log-ink); border-radius: .6rem; color-scheme: dark;
-  font: 400 .8125rem/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
-}
-.log .stage { color: #FFFFFF; font-weight: 700; }
-.note { margin: 1rem 0 0; color: var(--muted); font-size: .9375rem; }
-.failed p { max-width: 40rem; }
-.failed .reason { padding: .8rem 1rem; border-left: 4px solid var(--critical); background: var(--critical-soft); overflow-wrap: anywhere; }
-.actions { display: flex; flex-wrap: wrap; gap: .5rem; }
-
-/* Result */
-.result { padding-block: 2rem 4rem; }
-.verdict { display: grid; grid-template-columns: auto 1fr; gap: 1.75rem; align-items: center; margin-bottom: 2rem; }
-.ring { position: relative; width: 10.5rem; height: 10.5rem; color: var(--grade); }
-.ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
-.ring circle { fill: none; stroke-width: 10; }
-.ring .track { stroke: var(--line); }
-.ring .value { stroke: currentColor; stroke-linecap: round; transition: stroke-dashoffset 1.1s cubic-bezier(.2, .7, .2, 1); }
-.ring .grade {
-  position: absolute; inset: 0; display: grid; place-items: center;
-  font: 800 5.25rem/1 var(--display); font-stretch: 75%; letter-spacing: -.02em;
-}
-.verdict h1 { margin: 0 0 .35rem; font: 700 clamp(1.25rem, 3vw, 1.625rem)/1.25 var(--display); font-stretch: 90%; overflow-wrap: anywhere; }
-.score-line { margin: 0 0 .75rem; font-size: 1.0625rem; }
-.score-line strong { font-size: 1.5rem; font-variant-numeric: tabular-nums; }
-.badges { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
-.badge { display: inline-flex; align-items: center; gap: .4rem; padding: .25rem .65rem; border-radius: 99px; font-size: .875rem; font-weight: 600; }
-.badge svg { width: 1rem; height: 1rem; flex: none; }
-.badge.good { background: var(--good-soft); color: var(--good); }
-.badge.warning { background: var(--warning-soft); color: var(--warning); }
-.badge.critical { background: var(--critical-soft); color: var(--critical); }
-.badge.plain { background: var(--accent-soft); color: var(--ink); }
-.summary { margin: 0 0 2rem; max-width: 46rem; }
-
-.tabs { display: flex; gap: .25rem; box-shadow: inset 0 -1px 0 var(--line); overflow-x: auto; overflow-y: hidden; }
-.tab {
-  flex: none; padding: .75rem 1rem; border: 0; border-bottom: 3px solid transparent;
-  background: none; color: var(--muted); font-weight: 600; cursor: pointer;
-}
-.tab:hover { color: var(--ink); }
-.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
-.tab .n { font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
-.panel { padding-top: 1.5rem; }
-
-.filters { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1.25rem; }
-.chip {
-  min-height: 2.25rem; padding: 0 .85rem; border: 1px solid var(--line); border-radius: 99px;
-  background: var(--surface); font-weight: 500; cursor: pointer;
-}
-.chip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--paper); }
-
-.category { border: 1px solid var(--line); border-radius: .6rem; background: var(--surface); }
-.category + .category { margin-top: .6rem; }
-.category > summary {
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(5rem, 12rem) 2.75rem; gap: 1rem; align-items: center;
-  padding: .9rem 1rem; cursor: pointer; list-style: none;
-}
-.category > summary::-webkit-details-marker { display: none; }
-.category h3 { margin: 0; font: 600 1.0625rem/1.3 var(--body); }
-.category .meta { display: block; color: var(--muted); font-size: .875rem; font-weight: 400; }
-.meter { height: .5rem; border-radius: 99px; background: var(--line); overflow: hidden; }
-.meter i { display: block; height: 100%; border-radius: inherit; background: var(--grade); }
-.category .num { text-align: right; font: 700 1.25rem/1 var(--display); font-variant-numeric: tabular-nums; color: var(--grade); }
-.findings { list-style: none; margin: 0; padding: 0 1rem; border-top: 1px solid var(--line); }
-.finding { display: grid; grid-template-columns: 1.25rem 1fr; gap: .75rem; padding: .85rem 0; }
-.finding + .finding { border-top: 1px solid var(--line); }
-.finding svg { width: 1.25rem; height: 1.25rem; margin-top: .15rem; }
-.finding.good svg { color: var(--good); }
-.finding.warning svg { color: var(--warning); }
-.finding.critical svg { color: var(--critical); }
-.finding p { margin: 0; overflow-wrap: anywhere; }
-.finding .issue { font-weight: 500; }
-.finding .sev { font-weight: 700; }
-.finding.good .sev { color: var(--good); }
-.finding.warning .sev { color: var(--warning); }
-.finding.critical .sev { color: var(--critical); }
-.finding .fix { margin-top: .2rem; color: var(--muted); }
-.empty { color: var(--muted); }
-
-.wins { margin: 0; padding-left: 1.25rem; max-width: 46rem; }
-.wins li { padding: .35rem 0; }
-.details h3 { margin: 2rem 0 .6rem; font: 600 1.0625rem/1.3 var(--body); }
-.details h3:first-child { margin-top: 0; }
-.details p, .details ul { max-width: 46rem; }
-.facts { display: grid; grid-template-columns: max-content 1fr; gap: .4rem 1.5rem; margin: 0; }
-.facts dt { color: var(--muted); }
-.facts dd { margin: 0; overflow-wrap: anywhere; }
-.table-scroll { overflow-x: auto; }
-table { border-collapse: collapse; min-width: 20rem; }
-th, td { padding: .5rem 1.5rem .5rem 0; text-align: left; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-th { color: var(--muted); font-weight: 500; }
-
-footer { border-top: 1px solid var(--line); color: var(--muted); font-size: .875rem; }
-footer .wrap { padding-block: 1rem; }
-footer p { margin: 0; max-width: 46rem; }
-
-@media (max-width: 40rem) {
-  .scan-row { flex-direction: column; }
-  .steps { grid-template-columns: repeat(2, 1fr); }
-  .verdict { grid-template-columns: 1fr; gap: 1.25rem; }
-  .ring { width: 8.5rem; height: 8.5rem; }
-  .ring .grade { font-size: 4.25rem; }
-  .category > summary { grid-template-columns: minmax(0, 1fr) 2.75rem; }
-  .category .meter { grid-column: 1 / -1; grid-row: 2; }
-  .facts { grid-template-columns: 1fr; gap: 0; }
-  .facts dd { margin-bottom: .6rem; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ring .value { transition: none; }
-}
-</style>
-</head>
-<body>
-
-<header class="bar">
-  <div class="wrap">
-    <button type="button" class="wordmark" id="home-link" aria-label="SEO Health Agent, start a new scan">
-      <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="12" fill="none" stroke="var(--line)" stroke-width="5"/><circle cx="16" cy="16" r="12" fill="none" stroke="var(--accent)" stroke-width="5" stroke-dasharray="58 76" stroke-linecap="round" transform="rotate(-90 16 16)"/></svg>
-      SEO Health Agent
-    </button>
-    <button type="button" class="theme-toggle" id="theme-toggle" data-mode="light" aria-label="Switch to dark mode" title="Switch to dark mode">
-      <svg class="to-dark" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
-      <svg class="to-light" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-    </button>
-  </div>
-</header>
-
-<main>
-  <!-- Home -->
-  <section class="home wrap" id="view-home">
-    <h1>Check a website's health</h1>
-    <p class="lede">Paste an address. Seven checks run against the live page, from technical SEO and content to speed, security, links and accessibility, and come back as one graded report.</p>
-    <form class="scan" id="scan-form" novalidate>
-      <div class="scan-row">
-        <input id="url" name="url" type="text" inputmode="url" autocomplete="url" autocapitalize="off" spellcheck="false"
-               placeholder="example.com" aria-label="Web address to scan" aria-describedby="form-error" required>
-        <button class="btn btn-primary" id="scan-btn" type="submit">Scan site</button>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SEO Health Agent</title>
+    <meta
+      name="description"
+      content="Paste a web address and get a graded SEO and site-health report."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='12' fill='none' stroke='%231F4FE0' stroke-width='5' stroke-dasharray='58 76' stroke-linecap='round' transform='rotate(-90 16 16)'/%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,500..800&family=Public+Sans:wght@400;500;600;700&display=swap"
+    />
+    <script src="theme.js"></script>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="wrap">
+        <button
+          type="button"
+          class="wordmark"
+          id="home-link"
+          aria-label="SEO Health Agent, start a new scan"
+        >
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <circle
+              cx="16"
+              cy="16"
+              r="12"
+              fill="none"
+              stroke="var(--line)"
+              stroke-width="5"
+            />
+            <circle
+              cx="16"
+              cy="16"
+              r="12"
+              fill="none"
+              stroke="var(--accent)"
+              stroke-width="5"
+              stroke-dasharray="58 76"
+              stroke-linecap="round"
+              transform="rotate(-90 16 16)"
+            />
+          </svg>
+          SEO Health Agent
+        </button>
+        <button
+          type="button"
+          class="theme-toggle"
+          id="theme-toggle"
+          data-mode="light"
+          aria-label="Switch to dark mode"
+          title="Switch to dark mode"
+        >
+          <svg
+            class="to-dark"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" />
+          </svg>
+          <svg
+            class="to-light"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <circle cx="12" cy="12" r="4" />
+            <path
+              d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"
+            />
+          </svg>
+        </button>
       </div>
-      <p class="form-error" id="form-error" role="alert" hidden></p>
-      <details class="options">
-        <summary>Scan options</summary>
-        <div class="options-body">
-          <div class="field">
-            <label for="mode">Depth</label>
-            <select id="mode" name="mode">
-              <option value="quick">Quick</option>
-              <option value="auto" selected>Standard</option>
-              <option value="deep">Thorough</option>
-            </select>
-            <p class="hint" id="mode-hint"></p>
+    </header>
+
+    <main>
+      <!-- Home -->
+      <section class="home wrap" id="view-home">
+        <h1>Check a website's health</h1>
+        <p class="lede">
+          Paste an address. Seven checks run against the live page, from
+          technical SEO and content to speed, security, links and accessibility,
+          and come back as one graded report.
+        </p>
+        <form class="scan" id="scan-form" novalidate>
+          <div class="scan-row">
+            <input
+              id="url"
+              name="url"
+              type="text"
+              inputmode="url"
+              autocomplete="url"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="example.com"
+              aria-label="Web address to scan"
+              aria-describedby="form-error"
+              required
+            />
+            <button class="btn btn-primary" id="scan-btn" type="submit">
+              Scan site
+            </button>
           </div>
-          <div class="field">
-            <label for="competitor">Compare with a competitor</label>
-            <input id="competitor" name="competitor" type="text" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="competitor.com">
-            <p class="hint">Optional. Adds a benchmarking section to the report.</p>
+          <p class="form-error" id="form-error" role="alert" hidden></p>
+          <details class="options">
+            <summary>Scan options</summary>
+            <div class="options-body">
+              <div class="field">
+                <label for="mode">Depth</label>
+                <select id="mode" name="mode">
+                  <option value="quick">Quick</option>
+                  <option value="auto" selected>Standard</option>
+                  <option value="deep">Thorough</option>
+                </select>
+                <p class="hint" id="mode-hint"></p>
+              </div>
+              <div class="field">
+                <label for="competitor">Compare with a competitor</label>
+                <input
+                  id="competitor"
+                  name="competitor"
+                  type="text"
+                  inputmode="url"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  placeholder="competitor.com"
+                />
+                <p class="hint">
+                  Optional. Adds a benchmarking section to the report.
+                </p>
+              </div>
+            </div>
+          </details>
+        </form>
+        <section class="recent" id="recent" aria-labelledby="recent-title" hidden>
+          <div class="recent-head">
+            <h2 id="recent-title">Your recent scans</h2>
+            <button type="button" class="recent-clear" id="recent-clear">
+              Clear list
+            </button>
           </div>
+          <ul id="recent-list"></ul>
+          <p class="hint">Kept in this browser only.</p>
+        </section>
+      </section>
+
+      <!-- Running -->
+      <section class="running wrap" id="view-running" hidden>
+        <h1>Scanning</h1>
+        <p class="target" id="running-url"></p>
+        <div class="now">
+          <span class="spinner" aria-hidden="true"></span>
+          <p class="now-text" role="status">
+            <b id="now-title">Starting the scan</b>
+            <small id="now-detail"></small>
+          </p>
+          <span class="now-time" id="elapsed" aria-live="off"></span>
         </div>
-      </details>
-    </form>
-  </section>
+        <ol class="steps" id="steps">
+          <li><b>Plan</b><small>Decide which checks to run</small></li>
+          <li>
+            <b>Inspect</b
+            ><small id="inspect-count">Run each check on the live page</small>
+          </li>
+          <li>
+            <b>Review</b><small>Write the report and double-check it</small>
+          </li>
+          <li><b>Save</b><small>Store the result for trend tracking</small></li>
+        </ol>
+        <div class="log-head">
+          <h2 id="log-title">Live activity</h2>
+        </div>
+        <pre
+          class="log"
+          id="log"
+          tabindex="0"
+          aria-labelledby="log-title"
+        ></pre>
+        <p class="note">
+          A scan usually takes 1 to 4 minutes. You can leave this page open or
+          come back to this address later.
+        </p>
+      </section>
 
-  <!-- Running -->
-  <section class="running wrap" id="view-running" hidden>
-    <h1>Scanning</h1>
-    <p class="target" id="running-url"></p>
-    <ol class="steps" id="steps">
-      <li><b>Plan</b><small>Decide which checks to run</small></li>
-      <li><b>Inspect</b><small id="inspect-count">Run each check on the live page</small></li>
-      <li><b>Review</b><small>Write the report and double-check it</small></li>
-      <li><b>Save</b><small>Store the result for trend tracking</small></li>
-    </ol>
-    <div class="log-head">
-      <h2 id="log-title">Live activity</h2>
-      <span id="elapsed" aria-live="off"></span>
-    </div>
-    <pre class="log" id="log" tabindex="0" aria-labelledby="log-title"></pre>
-    <p class="note">A scan usually takes one to four minutes. You can leave this page open or come back to this address later.</p>
-  </section>
-
-  <!-- Failed / expired -->
-  <section class="failed wrap" id="view-failed" hidden>
-    <h1 id="failed-title"></h1>
-    <p class="target" id="failed-url"></p>
-    <p class="reason" id="failed-reason"></p>
-    <p id="failed-help"></p>
-    <div class="actions">
-      <button type="button" class="btn btn-primary" id="failed-retry">Scan again</button>
-      <button type="button" class="btn" id="failed-new">Check another site</button>
-    </div>
-  </section>
-
-  <!-- Result -->
-  <section class="result wrap" id="view-result" hidden>
-    <div class="verdict">
-      <div class="ring" id="ring">
-        <svg viewBox="0 0 120 120" aria-hidden="true">
-          <circle class="track" cx="60" cy="60" r="52"/>
-          <circle class="value" id="ring-value" cx="60" cy="60" r="52"/>
-        </svg>
-        <div class="grade" id="grade"></div>
-      </div>
-      <div>
-        <h1 id="result-url"></h1>
-        <p class="score-line" id="score-line"></p>
-        <div class="badges" id="badges"></div>
+      <!-- Failed / expired -->
+      <section class="failed wrap" id="view-failed" hidden>
+        <h1 id="failed-title"></h1>
+        <p class="target" id="failed-url"></p>
+        <p class="reason" id="failed-reason"></p>
+        <p id="failed-help"></p>
         <div class="actions">
-          <button type="button" class="btn btn-primary" id="rescan">Scan again</button>
-          <button type="button" class="btn" id="new-scan">Check another site</button>
+          <button type="button" class="btn btn-primary" id="failed-retry">
+            Scan again
+          </button>
+          <button type="button" class="btn" id="failed-new">
+            Check another site
+          </button>
         </div>
+      </section>
+
+      <!-- Result -->
+      <section class="result wrap" id="view-result" hidden>
+        <div class="verdict">
+          <div class="ring" id="ring">
+            <svg viewBox="0 0 120 120" aria-hidden="true">
+              <circle class="track" cx="60" cy="60" r="52" />
+              <circle class="value" id="ring-value" cx="60" cy="60" r="52" />
+            </svg>
+            <div class="grade" id="grade"></div>
+          </div>
+          <div>
+            <h1 id="result-url"></h1>
+            <p class="score-line" id="score-line"></p>
+            <div class="badges" id="badges"></div>
+            <div class="actions">
+              <button type="button" class="btn btn-primary" id="rescan">
+                Scan again
+              </button>
+              <button type="button" class="btn" id="new-scan">
+                Check another site
+              </button>
+              <a class="btn" id="pdf-link" href="#" download>Download PDF</a>
+            </div>
+          </div>
+        </div>
+        <p class="summary" id="summary"></p>
+
+        <div class="tabs" role="tablist" aria-label="Report sections">
+          <button
+            class="tab"
+            role="tab"
+            id="tab-findings"
+            aria-controls="panel-findings"
+            aria-selected="true"
+          >
+            Findings <span class="n" id="n-findings"></span>
+          </button>
+          <button
+            class="tab"
+            role="tab"
+            id="tab-wins"
+            aria-controls="panel-wins"
+            aria-selected="false"
+            tabindex="-1"
+          >
+            Quick wins <span class="n" id="n-wins"></span>
+          </button>
+          <button
+            class="tab"
+            role="tab"
+            id="tab-details"
+            aria-controls="panel-details"
+            aria-selected="false"
+            tabindex="-1"
+          >
+            Details
+          </button>
+        </div>
+        <div
+          class="panel"
+          role="tabpanel"
+          id="panel-findings"
+          aria-labelledby="tab-findings"
+          tabindex="0"
+        >
+          <div
+            class="filters"
+            id="filters"
+            role="group"
+            aria-label="Filter findings"
+          ></div>
+          <div id="categories"></div>
+        </div>
+        <div
+          class="panel"
+          role="tabpanel"
+          id="panel-wins"
+          aria-labelledby="tab-wins"
+          tabindex="0"
+          hidden
+        ></div>
+        <div
+          class="panel details"
+          role="tabpanel"
+          id="panel-details"
+          aria-labelledby="tab-details"
+          tabindex="0"
+          hidden
+        ></div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p>
+          Automated checks catch only part of what a manual audit would. Treat a
+          clean result as a starting point, not proof.
+        </p>
       </div>
-    </div>
-    <p class="summary" id="summary"></p>
+    </footer>
 
-    <div class="tabs" role="tablist" aria-label="Report sections">
-      <button class="tab" role="tab" id="tab-findings" aria-controls="panel-findings" aria-selected="true">Findings <span class="n" id="n-findings"></span></button>
-      <button class="tab" role="tab" id="tab-wins" aria-controls="panel-wins" aria-selected="false" tabindex="-1">Quick wins <span class="n" id="n-wins"></span></button>
-      <button class="tab" role="tab" id="tab-details" aria-controls="panel-details" aria-selected="false" tabindex="-1">Details</button>
-    </div>
-    <div class="panel" role="tabpanel" id="panel-findings" aria-labelledby="tab-findings" tabindex="0">
-      <div class="filters" id="filters" role="group" aria-label="Filter findings"></div>
-      <div id="categories"></div>
-    </div>
-    <div class="panel" role="tabpanel" id="panel-wins" aria-labelledby="tab-wins" tabindex="0" hidden></div>
-    <div class="panel details" role="tabpanel" id="panel-details" aria-labelledby="tab-details" tabindex="0" hidden></div>
-  </section>
-</main>
-
-<footer>
-  <div class="wrap">
-    <p>Automated checks catch only part of what a manual audit would. Treat a clean result as a starting point, not proof.</p>
-  </div>
-</footer>
-
-<script>
-(() => {
-  "use strict";
-
-  const POLL_MS = 2000;
-  const RING_LENGTH = 2 * Math.PI * 52;
-  const $ = (id) => document.getElementById(id);
-
-  const MODE_HINTS = {
-    quick: "Fastest. Uses the small model for everything, so findings are less detailed.",
-    auto: "Uses the strong model and switches to the small one if it runs out of quota.",
-    deep: "Strong model only. Best quality, but the scan fails if its quota is used up.",
-  };
-  const SEVERITY = {
-    critical: { label: "Critical", plural: "Critical", icon: "M12 2 21 7v10l-9 5-9-5V7zM12 7v6M12 16.5v.5" },
-    warning: { label: "Warning", plural: "Warnings", icon: "M12 3 22 20H2zM12 10v4.5M12 17.5v.5" },
-    good: { label: "Passed", plural: "Passed", icon: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM7.5 12.5l3 3 6-6.5" },
-  };
-  const SEVERITY_ORDER = ["critical", "warning", "good"];
-
-  let pollTimer = null;
-  let tickTimer = null;
-  let lastSubmit = null;   // {url, mode, competitor_url} of the scan on screen
-  let filter = "all";
-  let currentReport = null;
-
-  // --- DOM helpers -----------------------------------------------------
-  // Everything in a report is text written by a model about someone else's
-  // website. It only ever reaches the page as text nodes, never as HTML.
-  function el(tag, props, ...children) {
-    const node = document.createElement(tag);
-    for (const [key, value] of Object.entries(props || {})) {
-      if (key === "class") node.className = value;
-      else if (key === "text") node.textContent = value;
-      else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
-      else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, value);
-    }
-    for (const child of children) if (child) node.append(child);
-    return node;
-  }
-
-  function icon(path) {
-    const ns = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(ns, "svg");
-    svg.setAttribute("viewBox", "0 0 24 24");
-    svg.setAttribute("aria-hidden", "true");
-    const p = document.createElementNS(ns, "path");
-    p.setAttribute("d", path);
-    p.setAttribute("fill", "none");
-    p.setAttribute("stroke", "currentColor");
-    p.setAttribute("stroke-width", "2");
-    p.setAttribute("stroke-linecap", "round");
-    p.setAttribute("stroke-linejoin", "round");
-    svg.append(p);
-    return svg;
-  }
-
-  function show(view) {
-    for (const name of ["home", "running", "failed", "result"]) $("view-" + name).hidden = name !== view;
-    window.scrollTo(0, 0);
-  }
-
-  function gradeVar(score) {
-    const letter = score >= 90 ? "a" : score >= 80 ? "b" : score >= 70 ? "c" : score >= 60 ? "d" : "f";
-    return `var(--grade-${letter})`;
-  }
-
-  const fmtScore = (n) => (Number.isFinite(n) ? String(Math.round(n * 10) / 10) : "?");
-  const fmtDate = (value) => {
-    const d = new Date(value);
-    return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-  };
-  const fmtDuration = (seconds) => {
-    const s = Math.max(0, Math.round(seconds));
-    return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`;
-  };
-
-  // --- Starting a scan -------------------------------------------------
-  function setFormError(message) {
-    $("form-error").textContent = message || "";
-    $("form-error").hidden = !message;
-  }
-
-  async function startScan(request) {
-    setFormError("");
-    $("scan-btn").disabled = true;
-    try {
-      const resp = await fetch("/api/audit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      });
-      const body = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        // 422 comes back as a list of field errors; everything else as text.
-        const detail = typeof body.detail === "string" ? body.detail : "Enter a web address, like example.com.";
-        throw new Error(detail);
-      }
-      lastSubmit = request;
-      location.hash = "job=" + body.job_id;
-    } catch (err) {
-      show("home");
-      setFormError(err instanceof TypeError ? "Couldn't reach the scanner. Check your connection and try again." : err.message);
-      $("url").focus();
-    } finally {
-      $("scan-btn").disabled = false;
-    }
-  }
-
-  $("scan-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const url = $("url").value.trim();
-    if (!url) {
-      setFormError("Enter a web address, like example.com.");
-      $("url").focus();
-      return;
-    }
-    startScan({ url, mode: $("mode").value, competitor_url: $("competitor").value.trim() || null });
-  });
-
-  const syncModeHint = () => { $("mode-hint").textContent = MODE_HINTS[$("mode").value]; };
-  $("mode").addEventListener("change", syncModeHint);
-  syncModeHint();
-
-  // --- Running ---------------------------------------------------------
-  function stopTimers() {
-    clearTimeout(pollTimer);
-    clearInterval(tickTimer);
-    pollTimer = tickTimer = null;
-  }
-
-  function renderProgress(job) {
-    $("running-url").textContent = job.url;
-    const logs = job.logs || [];
-
-    let stage = 0, total = 0, finished = 0;
-    for (const line of logs) {
-      const m = /^Stage (\d)\/4/.exec(line);
-      if (m) stage = Math.max(stage, Number(m[1]));
-      const d = /Dispatching (\d+) specialist/.exec(line);
-      if (d) total = Number(d[1]);
-      if (/specialist (done|FAILED)/.test(line)) finished += 1;
-    }
-    [...$("steps").children].forEach((li, i) => {
-      li.dataset.state = i + 1 < stage ? "done" : i + 1 === stage ? "active" : "todo";
-      if (i + 1 === stage) li.setAttribute("aria-current", "step"); else li.removeAttribute("aria-current");
-    });
-    if (total) $("inspect-count").textContent = `${Math.min(finished, total)} of ${total} checks finished`;
-
-    const log = $("log");
-    const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    for (let i = log.childElementCount; i < logs.length; i++) {
-      log.append(el("div", { class: /^Stage \d\/4/.test(logs[i]) ? "stage" : "", text: logs[i] }));
-    }
-    if (pinned) log.scrollTop = log.scrollHeight;
-  }
-
-  function beginRunning(job) {
-    $("log").replaceChildren();
-    $("inspect-count").textContent = "Run each check on the live page";
-    show("running");
-    const tick = () => { $("elapsed").textContent = fmtDuration(Date.now() / 1000 - job.started_at); };
-    tick();
-    clearInterval(tickTimer);
-    tickTimer = setInterval(tick, 1000);
-  }
-
-  async function poll(jobId, first) {
-    let job;
-    try {
-      const resp = await fetch("/api/audit/" + encodeURIComponent(jobId));
-      if (resp.status === 404) {
-        stopTimers();
-        return showFailed({
-          title: "This result is no longer available",
-          reason: "Results are kept for an hour after a scan finishes, and are cleared when the scanner restarts.",
-          help: "Run the scan again to get a fresh report.",
-          canRetry: Boolean(lastSubmit),
-        });
-      }
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      job = await resp.json();
-    } catch (err) {
-      // A dropped connection shouldn't lose a scan that is still running.
-      pollTimer = setTimeout(() => poll(jobId, first), POLL_MS * 2);
-      return;
-    }
-
-    lastSubmit = lastSubmit || { url: job.url, mode: job.mode, competitor_url: job.competitor_url };
-
-    if (job.status === "running") {
-      if (first || $("view-running").hidden) beginRunning(job);
-      renderProgress(job);
-      pollTimer = setTimeout(() => poll(jobId, false), POLL_MS);
-    } else if (job.status === "done") {
-      stopTimers();
-      renderResult(job);
-    } else {
-      stopTimers();
-      showFailed({
-        title: "The scan couldn't finish",
-        url: job.url,
-        reason: job.error || "The scanner stopped without saying why.",
-        help: /quota|rate limit|exhausted/i.test(job.error || "")
-          ? "The models are out of free quota for now. Try a Quick scan, or come back later."
-          : "This can happen when a site blocks automated visits or the models are briefly unavailable.",
-        canRetry: true,
-      });
-    }
-  }
-
-  function showFailed({ title, url, reason, help, canRetry }) {
-    $("failed-title").textContent = title;
-    $("failed-url").textContent = url || "";
-    $("failed-url").hidden = !url;
-    $("failed-reason").textContent = reason;
-    $("failed-help").textContent = help;
-    $("failed-retry").hidden = !canRetry;
-    show("failed");
-  }
-
-  // --- Result ----------------------------------------------------------
-  function countBySeverity(report) {
-    const counts = { critical: 0, warning: 0, good: 0 };
-    for (const cat of report.categories || []) {
-      for (const f of cat.findings || []) if (f.severity in counts) counts[f.severity] += 1;
-    }
-    return counts;
-  }
-
-  function renderResult(job) {
-    const report = job.report || {};
-    currentReport = report;
-    filter = "all";
-    const score = Number(report.overall_score);
-
-    $("ring").style.setProperty("--grade", gradeVar(score));
-    $("grade").textContent = report.grade || "?";
-    $("ring").setAttribute("role", "img");
-    $("ring").setAttribute("aria-label", `Grade ${report.grade}, ${fmtScore(score)} out of 100`);
-    const ring = $("ring-value");
-    ring.style.strokeDasharray = String(RING_LENGTH);
-    ring.style.strokeDashoffset = String(RING_LENGTH);
-
-    $("result-url").textContent = report.url || job.url;
-    $("score-line").replaceChildren(el("strong", { text: fmtScore(score) }), " out of 100");
-
-    const badges = [];
-    if (report.review_status === "approved") {
-      badges.push(el("span", { class: "badge good" }, icon(SEVERITY.good.icon), "Reviewed and approved"));
-    } else if (report.review_status === "not_approved") {
-      badges.push(el("span", { class: "badge warning" }, icon(SEVERITY.warning.icon), "Reviewer did not sign off"));
-    }
-    const trend = report.trend;
-    if (trend && Number.isFinite(Number(trend.score_delta))) {
-      const delta = Number(trend.score_delta);
-      const words = delta > 0 ? `Up ${fmtScore(delta)} points` : delta < 0 ? `Down ${fmtScore(-delta)} points` : "No change";
-      badges.push(el("span", { class: "badge " + (delta > 0 ? "good" : delta < 0 ? "critical" : "plain"),
-                               text: `${words} since ${fmtDate(trend.previous_timestamp)}` }));
-    }
-    $("badges").replaceChildren(...badges);
-    $("summary").textContent = report.summary || "";
-
-    const counts = countBySeverity(report);
-    $("n-findings").textContent = String(counts.critical + counts.warning + counts.good);
-    $("n-wins").textContent = String((report.quick_wins || []).length);
-
-    renderFilters(counts);
-    renderCategories();
-    renderWins(report);
-    renderDetails(job);
-    selectTab("findings");
-    show("result");
-
-    // The one piece of motion on the page: the ring fills to the score.
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      ring.style.strokeDashoffset = String(RING_LENGTH * (1 - Math.min(Math.max(score, 0), 100) / 100));
-    }));
-  }
-
-  function renderFilters(counts) {
-    const total = counts.critical + counts.warning + counts.good;
-    const make = (key, label) => el("button", {
-      type: "button", class: "chip", "aria-pressed": String(filter === key), text: label,
-      onclick: () => { filter = key; renderFilters(counts); renderCategories(); },
-    });
-    $("filters").replaceChildren(
-      make("all", `All ${total}`),
-      ...SEVERITY_ORDER.filter((s) => counts[s]).map((s) => make(s, `${SEVERITY[s].plural} ${counts[s]}`)),
-    );
-  }
-
-  function renderCategories() {
-    const categories = [...(currentReport.categories || [])].sort((a, b) => a.score - b.score);
-    const nodes = [];
-    for (const cat of categories) {
-      const all = [...(cat.findings || [])].sort(
-        (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity));
-      const visible = filter === "all" ? all : all.filter((f) => f.severity === filter);
-      if (!visible.length) continue;
-
-      const problems = all.filter((f) => f.severity !== "good").length;
-      const meta = `${problems ? `${problems} to fix` : "Nothing to fix"}, counts for ${Math.round(cat.weight * 100)}% of the score`;
-      const items = visible.map((f) => {
-        const sev = SEVERITY[f.severity] || SEVERITY.warning;
-        const fix = (f.recommendation || "").trim();
-        const noAction = /^no (further )?(action|changes?)( is| are)? (needed|required)/i.test(fix);
-        return el("li", { class: "finding " + f.severity }, icon(sev.icon), el("div", null,
-          el("p", { class: "issue" }, el("span", { class: "sev", text: sev.label + ": " }), f.issue || ""),
-          fix && !noAction ? el("p", { class: "fix", text: fix }) : null));
-      });
-
-      nodes.push(el("details", { class: "category", style: `--grade:${gradeVar(cat.score)}`,
-                                 open: filter !== "all" || problems > 0 ? "" : null },
-        el("summary", null,
-          el("h3", null, cat.name, el("span", { class: "meta", text: meta })),
-          el("div", { class: "meter", "aria-hidden": "true" },
-            el("i", { style: `width:${Math.min(Math.max(cat.score, 0), 100)}%` })),
-          el("span", { class: "num", text: fmtScore(cat.score), "aria-label": `${fmtScore(cat.score)} out of 100` })),
-        el("ul", { class: "findings" }, ...items)));
-    }
-    $("categories").replaceChildren(...(nodes.length ? nodes : [el("p", { class: "empty", text: "No findings in this report." })]));
-  }
-
-  function renderWins(report) {
-    const wins = report.quick_wins || [];
-    $("panel-wins").replaceChildren(wins.length
-      ? el("ul", { class: "wins" }, ...wins.map((w) => el("li", { text: w })))
-      : el("p", { class: "empty", text: "This report has no quick wins listed." }));
-  }
-
-  function renderDetails(job) {
-    const report = job.report || {};
-    const modeNames = { quick: "Quick", auto: "Standard", deep: "Thorough" };
-    const fact = (term, value) => [el("dt", { text: term }), el("dd", { text: value })];
-    const nodes = [
-      el("h3", { text: "This scan" }),
-      el("dl", { class: "facts" },
-        ...fact("Address", report.url || job.url),
-        ...fact("Depth", modeNames[job.mode] || job.mode || "Standard"),
-        ...(job.competitor_url ? fact("Compared with", job.competitor_url) : []),
-        ...fact("Finished", new Date(job.finished_at * 1000).toLocaleString()),
-        ...fact("Took", fmtDuration(job.finished_at - job.started_at)),
-        ...fact("Review", report.review_status === "approved" ? "Approved by the reviewer" : "Not approved by the reviewer")),
-    ];
-
-    const issues = report.unresolved_review_issues || [];
-    if (report.review_status === "not_approved") {
-      nodes.push(el("h3", { text: "What the reviewer still objected to" }));
-      nodes.push(el("p", { text: "A second model checks every report against the raw evidence. It did not approve this one, so read the findings with extra care." }));
-      if (issues.length) nodes.push(el("ul", null, ...issues.map((i) => el("li", { text: i }))));
-    }
-
-    if (report.data_limitations) {
-      nodes.push(el("h3", { text: "What this scan could not check" }));
-      nodes.push(el("p", { text: report.data_limitations }));
-    }
-
-    const history = el("div", null, el("p", { class: "empty", text: "Loading earlier scans…" }));
-    nodes.push(el("h3", { text: "Earlier scans of this site" }), history);
-    $("panel-details").replaceChildren(...nodes);
-    loadHistory(report.url || job.url, history);
-  }
-
-  async function loadHistory(url, container) {
-    let rows = [];
-    try {
-      const host = new URL(url).host;
-      const resp = await fetch("/api/history/" + encodeURIComponent(host) + "?limit=10");
-      if (resp.ok) rows = (await resp.json()).history || [];
-    } catch (err) { /* history is a nice-to-have; an empty table is fine */ }
-
-    if (rows.length < 2) {
-      container.replaceChildren(el("p", { class: "empty", text: "This is the first scan of this site. Scan it again later to see how the score moves." }));
-      return;
-    }
-    container.replaceChildren(el("div", { class: "table-scroll" }, el("table", null,
-      el("thead", null, el("tr", null, el("th", { text: "Date" }), el("th", { text: "Score" }), el("th", { text: "Grade" }))),
-      el("tbody", null, ...rows.map((r) => el("tr", null,
-        el("td", { text: new Date(r.timestamp).toLocaleString() }),
-        el("td", { text: fmtScore(Number(r.overall_score)) }),
-        el("td", { text: r.grade || "" })))))));
-  }
-
-  // --- Tabs ------------------------------------------------------------
-  const TABS = ["findings", "wins", "details"];
-  function selectTab(name, focus) {
-    for (const t of TABS) {
-      const selected = t === name;
-      $("tab-" + t).setAttribute("aria-selected", String(selected));
-      $("tab-" + t).tabIndex = selected ? 0 : -1;
-      $("panel-" + t).hidden = !selected;
-    }
-    if (focus) $("tab-" + name).focus();
-  }
-  TABS.forEach((name, i) => {
-    $("tab-" + name).addEventListener("click", () => selectTab(name));
-    $("tab-" + name).addEventListener("keydown", (event) => {
-      const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
-      if (step) selectTab(TABS[(i + step + TABS.length) % TABS.length], true);
-    });
-  });
-
-  // --- Light / dark mode -----------------------------------------------
-  // Follows the system until the visitor uses the toggle; after that their
-  // choice is remembered on this device.
-  const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
-  const activeTheme = () => document.documentElement.dataset.theme || (systemDark.matches ? "dark" : "light");
-  function syncThemeToggle() {
-    const mode = activeTheme();
-    const label = mode === "dark" ? "Switch to light mode" : "Switch to dark mode";
-    $("theme-toggle").dataset.mode = mode;
-    $("theme-toggle").setAttribute("aria-label", label);
-    $("theme-toggle").title = label;
-  }
-  $("theme-toggle").addEventListener("click", () => {
-    const next = activeTheme() === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    try { localStorage.setItem("theme", next); } catch (err) { /* choice lasts for this visit only */ }
-    syncThemeToggle();
-  });
-  systemDark.addEventListener("change", syncThemeToggle);
-  syncThemeToggle();
-
-  // --- Navigation ------------------------------------------------------
-  function goHome() {
-    stopTimers();
-    if (location.hash) history.pushState(null, "", location.pathname);
-    show("home");
-    $("url").focus();
-  }
-  function rescan() {
-    if (lastSubmit) startScan(lastSubmit); else goHome();
-  }
-  $("home-link").addEventListener("click", goHome);
-  $("new-scan").addEventListener("click", goHome);
-  $("failed-new").addEventListener("click", goHome);
-  $("rescan").addEventListener("click", rescan);
-  $("failed-retry").addEventListener("click", rescan);
-
-  // The job id lives in the address, so a refresh or a shared link resumes
-  // the same scan for as long as the server still has it.
-  function route() {
-    stopTimers();
-    const match = /^#job=([0-9a-f]{8,64})$/.exec(location.hash);
-    if (match) poll(match[1], true);
-    else show("home");
-  }
-  window.addEventListener("hashchange", route);
-  route();
-})();
-</script>
-</body>
+    <script src="app.js"></script>
+  </body>
 </html>

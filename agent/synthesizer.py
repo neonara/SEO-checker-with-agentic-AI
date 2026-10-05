@@ -50,10 +50,11 @@ in your output. Do not rename, rephrase, or invent alternative category names.
 def run_synthesizer(
     url: str, specialist_reports: dict[str, dict], previous_audit: dict | None,
     model: str = DEFAULT_MODEL, fallback_model: str | None = FALLBACK_MODEL,
-    key_index: int = 0, log_fn=None
+    key_index: int = 0, log_fn=None, deadline: float | None = None
 ) -> dict:
     agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=model,
-                       fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index, log_fn=log_fn)
+                       fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index,
+                       log_fn=log_fn, deadline=deadline)
 
     specialist_reports = maybe_compact_specialist_reports(specialist_reports, log_fn=log_fn)
 

@@ -42,6 +42,10 @@ def _fake_response(status_code=200, text="", headers=None, url="https://example.
     resp.status_code = status_code
     resp.text = text
     resp.content = text.encode()
+    # The tools read bodies as a capped stream, not through .text/.content.
+    resp.iter_content.side_effect = lambda chunk_size=65536: iter(
+        [resp.content[i:i + chunk_size] for i in range(0, len(resp.content), chunk_size)])
+    resp.encoding = "utf-8"
     resp.headers = headers or {"Content-Type": "text/html"}
     resp.url = url
     resp.history = []
@@ -79,6 +83,7 @@ class TestFetchPage:
 
     def test_flags_likely_blocked_on_503_and_429_and_401(self):
         for code in (401, 429, 503):
+            tools.clear_caches()
             resp = _fake_response(code, text="blocked")
             with patch.object(tools.requests, "get", return_value=resp):
                 result = tools.fetch_page("example.com")
@@ -257,7 +262,7 @@ class TestCheckSslCertificate:
 
 class TestCheckCoreWebVitals:
     def setup_method(self):
-        tools._lighthouse_cache.clear()
+        tools.clear_caches()
 
     LIGHTHOUSE_PAYLOAD = {
         "lighthouseResult": {
@@ -325,22 +330,80 @@ class TestCheckCoreWebVitals:
             tools.check_core_web_vitals("example.com", strategy="desktop")
         assert mock_get.call_count == 2
 
-    def test_failed_call_is_not_cached_so_a_later_call_retries(self):
+    def test_failure_is_reused_within_an_audit_and_retried_in_the_next(self):
+        """Three specialists ask for the same Lighthouse run. Once it has
+        failed after its retries, the others must not each spend another
+        round of retries on it -- but the next audit (after clear_caches)
+        starts fresh."""
         bad = MagicMock(status_code=500, text="server error")
         good = MagicMock(status_code=200)
         good.json.return_value = self.LIGHTHOUSE_PAYLOAD
         with patch.object(tools.time, "sleep", return_value=None):
-            with patch.object(tools.requests, "get", return_value=bad):
+            with patch.object(tools.requests, "get", return_value=bad) as mock_get:
                 first = tools.check_core_web_vitals("example.com")
-            assert first["ok"] is False
+                calls_after_first = mock_get.call_count
+                again = tools.check_accessibility_and_best_practices("example.com")
+                assert mock_get.call_count == calls_after_first
+            assert first["ok"] is False and again["ok"] is False
+            tools.clear_caches()
             with patch.object(tools.requests, "get", return_value=good):
                 second = tools.check_core_web_vitals("example.com")
             assert second["ok"] is True
 
+    def test_failure_reports_the_real_cause(self):
+        """The error used to say "see logs for the underlying error" while
+        nothing logged it, so a failed Lighthouse run could not be diagnosed."""
+        bad = MagicMock(status_code=400, text="API key not valid")
+        with patch.object(tools.requests, "get", return_value=bad):
+            result = tools.check_core_web_vitals("example.com")
+        assert "400" in result["error"] and "API key not valid" in result["error"]
+
+    def test_connection_error_text_does_not_leak_the_api_key(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_PAGESPEED_API_KEY", "SECRET123")
+        err = requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: /pagespeedonline/v5/runPagespeed?url=x&key=SECRET123 (Caused by ...)")
+        with patch.object(tools.requests, "get", side_effect=err), \
+             patch.object(tools.time, "sleep", return_value=None):
+            result = tools.check_core_web_vitals("example.com")
+        assert result["ok"] is False
+        assert "SECRET123" not in result["error"]
+
+    def test_rate_limited_pagespeed_call_is_retried(self):
+        limited = MagicMock(status_code=429, text="quota")
+        good = MagicMock(status_code=200)
+        good.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.requests, "get", side_effect=[limited, good]), \
+             patch.object(tools.time, "sleep", return_value=None):
+            assert tools.check_core_web_vitals("example.com")["ok"] is True
+
+    def test_concurrent_callers_share_one_request(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        good = MagicMock(status_code=200)
+        good.json.return_value = self.LIGHTHOUSE_PAYLOAD
+
+        def slow_get(*a, **k):
+            started.set()
+            release.wait(timeout=5)
+            return good
+
+        with patch.object(tools.requests, "get", side_effect=slow_get) as mock_get:
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(tools.check_core_web_vitals("example.com")))
+                       for _ in range(3)]
+            for t in threads:
+                t.start()
+            started.wait(timeout=5)
+            release.set()
+            for t in threads:
+                t.join(timeout=5)
+        assert mock_get.call_count == 1
+        assert [r["ok"] for r in results] == [True, True, True]
+
 
 class TestCheckAccessibilityAndBestPractices:
     def setup_method(self):
-        tools._lighthouse_cache.clear()
+        tools.clear_caches()
 
     LIGHTHOUSE_PAYLOAD = {
         "lighthouseResult": {
@@ -456,7 +519,7 @@ class TestFetchRobotsAndSitemap:
 
 class TestCheckBestPractices:
     def setup_method(self):
-        tools._lighthouse_cache.clear()
+        tools.clear_caches()
 
     LIGHTHOUSE_PAYLOAD = {
         "lighthouseResult": {
@@ -643,3 +706,66 @@ class TestClearCaches:
         tools.clear_caches()
         assert tools._page_cache == {}
         assert tools._lighthouse_cache == {}
+
+
+class TestOneFetchPerAudit:
+    def setup_method(self):
+        tools.clear_caches()
+
+    def test_second_fetch_of_the_same_url_reuses_the_first_result(self):
+        """Every specialist opens with fetch_page on the audited url; the
+        target used to be requested once per specialist."""
+        resp = _fake_response(200, text="<html>hi</html>")
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            first = tools.fetch_page("example.com")
+            second = tools.fetch_page("https://example.com")
+        assert mock_get.call_count == 1
+        assert second == first
+
+    def test_failed_fetch_is_not_reused(self):
+        with patch.object(tools.requests, "get", side_effect=requests.exceptions.ConnectionError("refused")):
+            assert tools.fetch_page("example.com")["ok"] is False
+        with patch.object(tools.requests, "get", return_value=_fake_response(200, text="<html></html>")):
+            assert tools.fetch_page("example.com")["ok"] is True
+
+    def test_next_audit_fetches_again(self):
+        resp = _fake_response(200, text="<html>hi</html>")
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            tools.fetch_page("example.com")
+            tools.clear_caches()
+            tools.fetch_page("example.com")
+        assert mock_get.call_count == 2
+
+
+class TestResponseSizeCap:
+    def setup_method(self):
+        tools.clear_caches()
+
+    def test_oversized_page_is_read_only_up_to_the_cap(self, monkeypatch):
+        """The url comes from a visitor or from the model: one link to a huge
+        file must not be read into memory whole."""
+        monkeypatch.setattr(tools, "MAX_PAGE_BYTES", 1000)
+        resp = _fake_response(200, text="a" * 500_000)
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            result = tools.fetch_page("example.com")
+        assert mock_get.call_args.kwargs["stream"] is True
+        assert result["truncated"] is True
+        assert result["content_length_bytes"] == 1000
+        assert len(tools._page_cache["https://example.com"]) == 1000
+        resp.close.assert_called()
+
+    def test_normal_page_is_not_marked_truncated(self):
+        with patch.object(tools.requests, "get", return_value=_fake_response(200, text="<html>hi</html>")):
+            result = tools.fetch_page("example.com")
+        assert "truncated" not in result
+        assert result["content_length_bytes"] == len("<html>hi</html>")
+
+    def test_link_check_get_fallback_never_downloads_the_body(self):
+        head_resp = _fake_response(405)
+        get_resp = _fake_response(200, text="x" * 10_000)
+        with patch.object(tools.requests, "head", return_value=head_resp), \
+             patch.object(tools.requests, "get", return_value=get_resp) as mock_get:
+            tools.check_links_status(["https://example.com/big.zip"])
+        assert mock_get.call_args.kwargs["stream"] is True
+        get_resp.iter_content.assert_not_called()
+        get_resp.close.assert_called()

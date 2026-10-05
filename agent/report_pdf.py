@@ -2,6 +2,8 @@
 polished, presentable PDF using reportlab/Platypus."""
 from __future__ import annotations
 
+from xml.sax.saxutils import escape
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -18,14 +20,23 @@ SEVERITY_COLORS = {
 SEVERITY_LABEL = {"good": "OK", "warning": "WARNING", "critical": "CRITICAL"}
 
 
-def export_report_pdf(report: dict, output_path: str) -> str:
+def _text(value) -> str:
+    """Report text for a Paragraph. Paragraph parses its input as markup, and
+    everything in a report was written by a model reading someone else's
+    website: unescaped, a finding that mentions "<title>" breaks the export,
+    and a crafted "<img src=...>" would make the server fetch that address."""
+    return escape("" if value is None else str(value))
+
+
+def export_report_pdf(report: dict, output_path) -> str:
+    """`output_path` is a file path or a writable binary file object."""
     doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="FindingText", parent=styles["Normal"], fontSize=9.5, leading=13))
     story = []
 
     story.append(Paragraph("SEO & Website Health Report", styles["Title"]))
-    story.append(Paragraph(report.get("url", ""), styles["Heading3"]))
+    story.append(Paragraph(_text(report.get("url", "")), styles["Heading3"]))
     story.append(Spacer(1, 10))
 
     score = report.get("overall_score", 0)
@@ -51,28 +62,28 @@ def export_report_pdf(report: dict, output_path: str) -> str:
         arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "→")
         story.append(Paragraph(
             f"<b>Trend:</b> {arrow} {delta:+g} points since last audit "
-            f"(previous score: {trend.get('previous_score')})",
+            f"(previous score: {_text(trend.get('previous_score'))})",
             styles["Normal"],
         ))
         story.append(Spacer(1, 10))
 
     story.append(Paragraph("Summary", styles["Heading2"]))
-    story.append(Paragraph(report.get("summary", ""), styles["Normal"]))
+    story.append(Paragraph(_text(report.get("summary", "")), styles["Normal"]))
     story.append(Spacer(1, 14))
 
     story.append(Paragraph("Category Breakdown", styles["Heading2"]))
     for cat in report.get("categories", []):
         story.append(Paragraph(
-            f"{cat['name']} &mdash; {cat['score']}/100 (weight {cat['weight']})",
+            f"{_text(cat['name'])} &mdash; {_text(cat['score'])}/100 (weight {_text(cat['weight'])})",
             styles["Heading3"],
         ))
         rows = [["Severity", "Issue", "Recommendation"]]
         for f in cat.get("findings", []):
             sev = f.get("severity", "")
             rows.append([
-                Paragraph(f'<font color="{SEVERITY_COLORS.get(sev, colors.black)}"><b>{SEVERITY_LABEL.get(sev, sev)}</b></font>', styles["FindingText"]),
-                Paragraph(f.get("issue", ""), styles["FindingText"]),
-                Paragraph(f.get("recommendation", ""), styles["FindingText"]),
+                Paragraph(f'<font color="{SEVERITY_COLORS.get(sev, colors.black)}"><b>{_text(SEVERITY_LABEL.get(sev, sev))}</b></font>', styles["FindingText"]),
+                Paragraph(_text(f.get("issue", "")), styles["FindingText"]),
+                Paragraph(_text(f.get("recommendation", "")), styles["FindingText"]),
             ])
         if len(rows) > 1:
             t = Table(rows, colWidths=[0.9 * inch, 2.6 * inch, 3.0 * inch], repeatRows=1)
@@ -92,12 +103,19 @@ def export_report_pdf(report: dict, output_path: str) -> str:
     if quick_wins:
         story.append(Paragraph("Quick Wins", styles["Heading2"]))
         for qw in quick_wins:
-            story.append(Paragraph(f"• {qw}", styles["Normal"]))
+            story.append(Paragraph(f"• {_text(qw)}", styles["Normal"]))
         story.append(Spacer(1, 12))
 
     if report.get("data_limitations"):
         story.append(Paragraph("Data Limitations", styles["Heading2"]))
-        story.append(Paragraph(report["data_limitations"], styles["Normal"]))
+        story.append(Paragraph(_text(report["data_limitations"]), styles["Normal"]))
+
+    skipped = report.get("skipped_categories") or []
+    if skipped:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Checks That Did Not Run", styles["Heading2"]))
+        for item in skipped:
+            story.append(Paragraph(f"• {_text(item.get('name'))}: {_text(item.get('reason'))}", styles["Normal"]))
 
     doc.build(story)
     return output_path

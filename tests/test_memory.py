@@ -91,3 +91,64 @@ class TestGetAllFullAudits:
             conn.execute("UPDATE audits SET report_json = 'not valid json' WHERE id = 1")
         reports = memory.get_all_full_audits()
         assert reports == []  # corrupted row skipped, not raised
+
+class TestTrendBaselineSelection:
+    """get_last_audit used to return the newest audit of the *domain*, so a
+    scan of /blog was "trended" against the homepage, and a run that had lost
+    half its categories became the baseline for the next one."""
+
+    def test_a_different_page_of_the_same_domain_is_not_the_baseline(self, tmp_db_path):
+        memory.save_audit("https://example.com/", {"overall_score": 90, "grade": "A"})
+        memory.save_audit("https://example.com/blog", {"overall_score": 40, "grade": "F"})
+        assert memory.get_last_audit("https://example.com")["overall_score"] == 90
+        assert memory.get_last_audit("https://example.com/blog/")["overall_score"] == 40
+        assert memory.get_last_audit("https://example.com/pricing") is None
+
+    def test_scheme_and_trailing_slash_do_not_make_a_different_page(self, tmp_db_path):
+        memory.save_audit("http://example.com/", {"overall_score": 70, "grade": "C"})
+        assert memory.get_last_audit("https://example.com")["overall_score"] == 70
+
+    def test_an_audit_that_skipped_checks_is_not_a_baseline(self, tmp_db_path):
+        memory.save_audit("https://example.com", {"overall_score": 81, "grade": "B"})
+        memory.save_audit("https://example.com", {
+            "overall_score": 55, "grade": "F",
+            "skipped_categories": [{"name": "Page Speed", "reason": "The check failed to complete."}],
+        })
+        assert memory.get_last_audit("https://example.com")["overall_score"] == 81
+
+
+class TestPublicId:
+    def test_saved_audit_is_retrievable_by_its_public_id(self, tmp_db_path):
+        memory.save_audit("https://example.com", {"overall_score": 88, "grade": "B"}, public_id="abc123")
+        fetched = memory.get_audit_by_public_id("abc123")
+        assert fetched["overall_score"] == 88
+        assert fetched["_stored_url"] == "https://example.com"
+        assert "_timestamp" in fetched
+        assert memory.get_audit_by_public_id("nope") is None
+
+    def test_a_public_id_is_generated_when_none_is_given(self, tmp_db_path):
+        memory.save_audit("https://example.com", {"overall_score": 88, "grade": "B"})
+        public_id = memory.get_history("https://example.com")[0]["public_id"]
+        assert len(public_id) == 32
+        assert memory.get_audit_by_public_id(public_id)["overall_score"] == 88
+
+    def test_database_created_before_public_ids_is_migrated_in_place(self, tmp_db_path):
+        """The live volume and the seed database predate the column."""
+        import sqlite3
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute("CREATE TABLE audits (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, "
+                     "url TEXT NOT NULL, timestamp TEXT NOT NULL, overall_score REAL NOT NULL, grade TEXT, "
+                     "report_json TEXT NOT NULL)")
+        for score in (60, 70):
+            conn.execute("INSERT INTO audits (domain, url, timestamp, overall_score, grade, report_json) "
+                         "VALUES ('example.com', 'https://example.com', '2026-09-01T00:00:00+00:00', ?, 'C', ?)",
+                         (score, '{"overall_score": %d}' % score))
+        conn.commit()
+        conn.close()
+
+        rows = memory.get_history("https://example.com")
+        ids = [r["public_id"] for r in rows]
+        assert all(ids) and len(set(ids)) == 2
+        assert memory.get_audit_by_public_id(ids[0])["overall_score"] == 70
+        # Stable across later calls: the backfill only touches empty rows.
+        assert [r["public_id"] for r in memory.get_history("https://example.com")] == ids

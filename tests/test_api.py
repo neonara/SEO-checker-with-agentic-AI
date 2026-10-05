@@ -29,9 +29,10 @@ def _public_dns(host, *args, **kwargs):
 
 
 @pytest.fixture
-def client(monkeypatch):
-    """A client against a clean job store, with the outbound guard on (as in
-    the Docker image) and every hostname resolving to a public address."""
+def client(monkeypatch, tmp_db_path):
+    """A client against a clean job store and an empty database, with the
+    outbound guard on (as in the Docker image) and every hostname resolving
+    to a public address."""
     api._jobs.clear()
     api._recent_starts.clear()
     monkeypatch.setenv("SEO_AGENT_BLOCK_PRIVATE_HOSTS", "1")
@@ -125,7 +126,7 @@ class TestAuditLifecycle:
         monkeypatch.setattr(api, "run_full_audit", boom)
         job = wait_for_job(client, start(client).json()["job_id"])
         assert job["status"] == "error"
-        assert job["error"] == "All models exhausted"
+        assert job["error_code"] == "internal"
         assert job["report"] is None
 
     def test_server_without_an_api_key_refuses_up_front(self, client, monkeypatch):
@@ -305,3 +306,188 @@ class TestOtherRoutes:
 
     def test_api_routes_are_not_shadowed_by_the_page(self, client):
         assert client.get("/api/health").headers["content-type"].startswith("application/json")
+
+
+class TestVisitorSafeErrors:
+    """The job's error used to be str(exception) and its logs the raw
+    progress lines. Provider errors name the account's organization id and
+    its billing page; neither belongs in front of a visitor."""
+
+    GROQ_TEXT = ("[Synthesizer] hit a Groq rate/quota limit requiring a wait longer than 15 minutes. "
+                 "Upgrade at https://console.groq.com/settings/billing.\n\nGroq's message: Rate limit "
+                 "reached for model `openai/gpt-oss-120b` in organization `org_01abcXYZ` on tokens per day")
+
+    def test_provider_error_text_never_reaches_the_visitor(self, client, monkeypatch):
+        def boom(url, **kwargs):
+            raise RuntimeError(self.GROQ_TEXT)
+
+        monkeypatch.setattr(api, "run_full_audit", boom)
+        job = wait_for_job(client, start(client).json()["job_id"])
+        assert job["status"] == "error"
+        assert job["error_code"] == "quota"
+        assert "org_01abcXYZ" not in job["error"]
+        assert "console.groq.com" not in job["error"]
+
+    def test_unexpected_exception_becomes_a_generic_message(self, client, monkeypatch):
+        def boom(url, **kwargs):
+            raise KeyError("/app/agent/secret_path.py")
+
+        monkeypatch.setattr(api, "run_full_audit", boom)
+        job = wait_for_job(client, start(client).json()["job_id"])
+        assert job["error_code"] == "internal"
+        assert "secret_path" not in job["error"]
+
+    def test_audit_failed_message_is_passed_through_with_its_code(self, client, monkeypatch):
+        def blocked(url, **kwargs):
+            raise api.AuditFailed("blocked", "This site blocked the scanner (it answered with HTTP 403).")
+
+        monkeypatch.setattr(api, "run_full_audit", blocked)
+        job = wait_for_job(client, start(client).json()["job_id"])
+        assert job["error_code"] == "blocked"
+        assert "403" in job["error"]
+
+    def test_log_lines_are_redacted_and_bounded(self, client, monkeypatch):
+        def chatty(url, log_fn=None, **kwargs):
+            log_fn("  -> links specialist FAILED: " + self.GROQ_TEXT)
+            log_fn("x" * 5000)
+            return dict(FAKE_REPORT)
+
+        monkeypatch.setattr(api, "run_full_audit", chatty)
+        job = wait_for_job(client, start(client).json()["job_id"])
+        assert "org_01abcXYZ" not in " ".join(job["logs"])
+        assert "Groq's message" not in " ".join(job["logs"])
+        assert job["logs"][0].startswith("  -> links specialist FAILED")
+        assert len(job["logs"][1]) <= api.MAX_LOG_LINE_CHARS + 3
+
+    def test_log_is_capped(self, client, monkeypatch):
+        def flood(url, log_fn=None, **kwargs):
+            for i in range(api.MAX_JOB_LOG_LINES + 50):
+                log_fn(f"line {i}")
+            return dict(FAKE_REPORT)
+
+        monkeypatch.setattr(api, "run_full_audit", flood)
+        job = wait_for_job(client, start(client).json()["job_id"])
+        assert len(job["logs"]) == api.MAX_JOB_LOG_LINES
+
+    def test_private_job_fields_are_not_returned(self, client):
+        job = wait_for_job(client, start(client).json()["job_id"])
+        assert "client_ip" not in job
+        assert "counted_at" not in job
+
+
+class TestRateLimitRefund:
+    def _fail_with(self, monkeypatch, exc):
+        def boom(url, **kwargs):
+            raise exc
+        monkeypatch.setattr(api, "run_full_audit", boom)
+
+    def test_server_side_failure_gives_the_slot_back(self, client, monkeypatch):
+        """A scan that died on our quota used to cost the visitor one of
+        their hourly audits all the same."""
+        self._fail_with(monkeypatch, RuntimeError("hit a Groq rate/quota limit"))
+        for i in range(api.RATE_LIMIT_PER_HOUR + 3):
+            resp = start(client, url=f"site{i}.example.com")
+            assert resp.status_code == 200
+            wait_for_job(client, resp.json()["job_id"])
+        assert len(api._recent_starts.get("testclient", [])) == 0
+
+    def test_timeout_gives_the_slot_back(self, client, monkeypatch):
+        self._fail_with(monkeypatch, api.AuditFailed("timeout", "The scan ran out of time."))
+        wait_for_job(client, start(client).json()["job_id"])
+        assert len(api._recent_starts.get("testclient", [])) == 0
+
+    def test_blocked_site_still_counts(self, client, monkeypatch):
+        self._fail_with(monkeypatch, api.AuditFailed("blocked", "This site blocked the scanner."))
+        wait_for_job(client, start(client).json()["job_id"])
+        assert len(api._recent_starts["testclient"]) == 1
+
+    def test_successful_audit_still_counts(self, client):
+        wait_for_job(client, start(client).json()["job_id"])
+        assert len(api._recent_starts["testclient"]) == 1
+
+
+class TestStoredReports:
+    """Jobs live in memory, so a finished report used to become a dead link
+    after an hour or after any deploy -- although the report itself was
+    sitting in SQLite."""
+
+    def _saving_audit(self, monkeypatch):
+        def audit(url, audit_id=None, mode="auto", competitor_url=None, **kwargs):
+            report = dict(FAKE_REPORT, url=url, mode=mode, competitor_url=competitor_url, duration_seconds=12.5)
+            memory.save_audit(url, report, public_id=audit_id)
+            return report
+        monkeypatch.setattr(api, "run_full_audit", audit)
+
+    def test_job_id_is_passed_to_the_audit_as_its_public_id(self, client, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(api, "run_full_audit", lambda url, **kw: seen.update(kw) or dict(FAKE_REPORT))
+        job_id = start(client).json()["job_id"]
+        wait_for_job(client, job_id)
+        assert seen["audit_id"] == job_id
+        assert seen["deadline_seconds"] == api.AUDIT_TIMEOUT_SECONDS
+
+    def test_finished_report_survives_losing_the_in_memory_job(self, client, monkeypatch):
+        self._saving_audit(monkeypatch)
+        job_id = start(client, mode="quick").json()["job_id"]
+        live = wait_for_job(client, job_id)
+        api._jobs.clear()  # what a restart or the TTL does
+
+        resp = client.get(f"/api/audit/{job_id}")
+        assert resp.status_code == 200
+        stored = resp.json()
+        assert stored["status"] == "done"
+        assert stored["url"] == "https://example.com"
+        assert stored["mode"] == "quick"
+        assert stored["report"]["overall_score"] == live["report"]["overall_score"]
+        assert stored["finished_at"] - stored["started_at"] == pytest.approx(12.5)
+        assert stored["logs"] == []
+        assert not [k for k in stored["report"] if k.startswith("_")]
+
+    def test_report_stored_before_this_feature_still_opens(self, client):
+        memory.save_audit("https://old.example.com", {"overall_score": 61, "grade": "D"}, public_id="a" * 32)
+        stored = client.get("/api/audit/" + "a" * 32).json()
+        assert stored["url"] == "https://old.example.com"
+        assert stored["mode"] is None and stored["started_at"] is None
+
+    def test_history_rows_carry_the_public_id(self, client):
+        memory.save_audit("https://example.com", {"overall_score": 70, "grade": "C"}, public_id="b" * 32)
+        row = client.get("/api/history/example.com").json()["history"][0]
+        assert row["public_id"] == "b" * 32
+
+    def test_malformed_id_is_404_without_a_lookup(self, client, monkeypatch):
+        monkeypatch.setattr(memory, "get_audit_by_public_id",
+                            lambda _id: pytest.fail("looked up a malformed id"))
+        assert client.get("/api/audit/1").status_code == 404
+        assert client.get("/api/audit/' OR 1=1 --").status_code == 404
+
+
+class TestPdf:
+    REPORT = dict(
+        FAKE_REPORT,
+        summary="Missing <title> tag & no <h1>; see <img src='http://127.0.0.1/x'>.",
+        categories=[{"name": "Technical SEO", "score": 70, "weight": 1.0, "findings": [
+            {"severity": "critical", "issue": "The <title> element is missing.",
+             "recommendation": "Add <title>Your page</title> inside <head>."}]}],
+        quick_wins=["Add a <meta name=\"description\"> tag."],
+        skipped_categories=[{"name": "Link Health", "reason": "The check failed to complete."}],
+    )
+
+    def test_pdf_of_a_finished_audit(self, client, monkeypatch):
+        """Report text is model output about someone else's site and is full
+        of angle brackets. Unescaped, reportlab parsed it as markup: the
+        export failed on "<title>", and "<img src=...>" would have made the
+        server fetch that address."""
+        monkeypatch.setattr(api, "run_full_audit", lambda url, **kw: dict(self.REPORT))
+        job_id = start(client).json()["job_id"]
+        wait_for_job(client, job_id)
+
+        resp = client.get(f"/api/audit/{job_id}/pdf")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "application/pdf"
+        assert "seo-report-example.com.pdf" in resp.headers["content-disposition"]
+        assert resp.content.startswith(b"%PDF")
+
+    def test_no_pdf_for_an_unknown_or_unfinished_audit(self, client, blocked_audits):
+        assert client.get("/api/audit/" + "c" * 32 + "/pdf").status_code == 404
+        running = start(client).json()["job_id"]
+        assert client.get(f"/api/audit/{running}/pdf").status_code == 404

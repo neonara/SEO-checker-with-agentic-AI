@@ -155,7 +155,8 @@ this site's niche.
 
 
 def build_specialist(key: str, log_fn=None, model: str | None = None,
-                      fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0) -> ToolAgent:
+                      fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0,
+                      deadline: float | None = None) -> ToolAgent:
     definition = SPECIALIST_DEFINITIONS[key]
     is_competitive = key == "competitive"
     effective_model = model or (COMPETITIVE_MODEL if is_competitive else DEFAULT_MODEL)
@@ -167,4 +168,5 @@ def build_specialist(key: str, log_fn=None, model: str | None = None,
         fallback_model=fallback_model,
         starting_key_index=key_index,
         log_fn=log_fn,
+        deadline=deadline,
     )

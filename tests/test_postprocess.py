@@ -233,7 +233,9 @@ class TestReconcileCoreWebVitals:
         ]}
         out = postprocess.reconcile_core_web_vitals(result, self.CWV_LOG)
         assert len(out["findings"]) == 1  # nothing appended
-        assert "_real_cwv_available" not in out
+        # The flag means "real data was obtained", not "a finding was injected"
+        # (see TestMeasuredScoresAndAvailabilityFlags for the bug that was).
+        assert out["_real_cwv_available"] is True
 
     def test_noop_when_cwv_tool_never_called(self):
         result = {"findings": []}
@@ -595,3 +597,48 @@ class TestReconcileBestPracticesData:
         out = postprocess.reconcile_best_practices_data({"findings": []}, log)
         assert out["findings"][0]["severity"] == "good"
         assert "No automated check failures detected" in out["findings"][0]["issue"]
+
+class TestMeasuredScoresAndAvailabilityFlags:
+    def _cwv_log(self, score=43, lcp=5200.0):
+        return [{"name": "check_core_web_vitals", "args": {"url": "https://example.com"},
+                 "result": {"ok": True, "lab_data": {"performance_score_0_100": score, "lcp_ms": lcp, "cls": 0.3},
+                            "good_thresholds_2026": {"lcp_ms": 2500, "cls": 0.1}}}]
+
+    def test_cwv_flag_is_set_when_the_model_already_cited_the_real_numbers(self):
+        """Reproduces a real bug: the flag was only set on the path that
+        injects a finding, so a specialist that DID cite the real data left
+        it unset and the stale "no real Core Web Vitals data" note was never
+        corrected -- exactly in the case where the model behaved well."""
+        from agent.postprocess import reconcile_core_web_vitals
+        result = {"category": "Page Speed", "score": 60, "findings": [
+            {"severity": "critical", "issue": "Lighthouse performance score is 43/100, LCP 5200 ms.",
+             "recommendation": "Optimize the hero image."}]}
+        out = reconcile_core_web_vitals(result, self._cwv_log())
+        assert len(out["findings"]) == 1  # nothing injected
+        assert out["_real_cwv_available"] is True
+
+    def test_performance_score_is_pinned_to_the_measured_lighthouse_score(self):
+        from agent.postprocess import reconcile_core_web_vitals
+        result = {"category": "Page Speed", "score": 85, "findings": []}
+        out = reconcile_core_web_vitals(result, self._cwv_log(score=43))
+        assert out["score"] == 43
+        assert out["_measured_score"] == 43
+
+    def test_accessibility_score_is_pinned_even_when_already_grounded(self):
+        from agent.postprocess import reconcile_accessibility_data
+        log = [{"name": "check_accessibility_and_best_practices", "args": {"url": "https://example.com"},
+                "result": {"ok": True, "accessibility_score_0_100": 71, "failing_accessibility_audits": []}}]
+        result = {"category": "Accessibility", "score": 95, "findings": [
+            {"severity": "warning", "issue": "Lighthouse accessibility score: 71/100.", "recommendation": "x"}]}
+        out = reconcile_accessibility_data(result, log)
+        assert out["score"] == 71
+        assert len(out["findings"]) == 1  # already grounded: nothing injected
+
+    def test_blocked_result_keeps_its_empty_score(self):
+        from agent.postprocess import reconcile_likely_blocked, reconcile_core_web_vitals
+        log = [{"name": "fetch_page", "args": {"url": "https://example.com"},
+                "result": {"ok": True, "status_code": 403, "likely_blocked": True}}] + self._cwv_log()
+        result = reconcile_likely_blocked({"category": "Page Speed", "score": 20, "findings": []}, log)
+        out = reconcile_core_web_vitals(result, log)
+        assert out["_likely_blocked"] is True
+        assert out["score"] is None
